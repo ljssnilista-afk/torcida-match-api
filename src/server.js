@@ -20,7 +20,9 @@ app.use(cors({
 }))
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
-
+app.get('/api/status', (req, res) => {
+  res.json({ status: 'OK', message: 'API funcionando!' });
+});
 // ─── Rotas ────────────────────────────────────────────────────────────────────
 app.use('/api/auth',    authRoutes)
 app.use('/api/profile', profileRoutes)
