@@ -5,6 +5,7 @@ const cors = require('cors')
 
 const authRoutes    = require('./routes/auth')
 const profileRoutes = require('./routes/profile')
+const bsdProxy      = require('./routes/bsdProxy')
 
 const app  = express()
 // Railway usa a variável de ambiente PORT, se não houver, usa 3001
@@ -23,7 +24,7 @@ app.use(cors({
     
     // Permite requisições sem origin (como aplicativos mobile ou ferramentas de teste)
     // ou se a origin estiver na lista, ou se terminar em .railway.app
-    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.railway.app') || origin.endsWith('.onrender.com')) {
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.railway.app') || origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
       callback(new Error('Bloqueado pelo CORS'));
@@ -44,8 +45,9 @@ app.get('/api/status', (req, res) => {
   res.json({ status: 'OK', message: 'API funcionando!', env: process.env.NODE_ENV });
 });
 
-app.use('/api/auth', authRoutes)
+app.use('/api/auth',    authRoutes)
 app.use('/api/profile', profileRoutes)
+app.use('/api/bsd',     bsdProxy)
 
 // Health check para Railway
 app.get('/health', (req, res) => {
@@ -74,8 +76,3 @@ mongoose
     console.error('❌ Erro ao conectar ao MongoDB:', err.message)
     process.exit(1)
   })
-// Após os outros requires de rotas:
-const bsdProxy = require('./routes/bsdProxy')
-
-// Após as outras app.use():
-app.use('/api/bsd', bsdProxy)
