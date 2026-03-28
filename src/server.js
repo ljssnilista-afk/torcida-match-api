@@ -7,41 +7,61 @@ const authRoutes    = require('./routes/auth')
 const profileRoutes = require('./routes/profile')
 
 const app  = express()
+// Railway usa a variável de ambiente PORT, se não houver, usa 3001
 const PORT = process.env.PORT || 3001
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
+
+// Unificando o CORS: configuramos para aceitar o que estiver no .env ou localhost
 app.use(cors({
-  origin: [
-    process.env.CLIENT_URL ?? 'http://localhost:5173',
-    /\.railway\.app$/,   // Railway deploy
-    /\.onrender\.com$/,  // Render deploy
-  ],
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      process.env.CLIENT_URL,
+      'http://localhost:5173', // Vite padrão
+      'http://localhost:3000'  // CRA padrão
+    ];
+    
+    // Permite requisições sem origin (como aplicativos mobile ou ferramentas de teste)
+    // ou se a origin estiver na lista, ou se terminar em .railway.app
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.railway.app') || origin.endsWith('.onrender.com')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Bloqueado pelo CORS'));
+    }
+  },
   credentials: true,
-}))
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
-app.get('/api/status', (req, res) => {
-  res.json({ status: 'OK', message: 'API funcionando!' });
-});
+
 // ─── Rotas ────────────────────────────────────────────────────────────────────
-app.use('/api/auth',    authRoutes)
+
+// Status rápido para teste
+app.get('/api/status', (req, res) => {
+  res.json({ status: 'OK', message: 'API funcionando!', env: process.env.NODE_ENV });
+});
+
+app.use('/api/auth', authRoutes)
 app.use('/api/profile', profileRoutes)
 
-// Health check (Railway/Render usam isso para verificar se o serviço está vivo)
+// Health check para Railway
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    app:    'TorcidaMatch API',
-    time:   new Date().toISOString(),
+    app: 'TorcidaMatch API',
+    time: new Date().toISOString(),
   })
 })
 
-// 404
+// 404 - Deve ser a última rota
 app.use((req, res) => {
   res.status(404).json({ error: `Rota ${req.method} ${req.path} não encontrada` })
 })
 
-// ─── Conecta ao MongoDB e sobe o servidor ─────────────────────────────────────
+// ─── Conexão ──────────────────────────────────────────────────────────────────
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
@@ -54,3 +74,8 @@ mongoose
     console.error('❌ Erro ao conectar ao MongoDB:', err.message)
     process.exit(1)
   })
+// Após os outros requires de rotas:
+const bsdProxy = require('./routes/bsdProxy')
+
+// Após as outras app.use():
+app.use('/api/bsd', bsdProxy)
