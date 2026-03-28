@@ -76,3 +76,5 @@ mongoose
     console.error('❌ Erro ao conectar ao MongoDB:', err.message)
     process.exit(1)
   })
+const gruposRoutes = require('./routes/grupos')
+app.use('/api/grupos', gruposRoutes)
