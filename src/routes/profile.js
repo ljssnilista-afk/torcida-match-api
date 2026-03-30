@@ -26,12 +26,17 @@ router.get('/:id', async (req, res) => {
 // Atualiza o perfil do usuário logado
 router.put('/me', authMiddleware, async (req, res) => {
   try {
-    const allowed = ['name', 'age', 'bairro', 'zona', 'email']
+    const allowed = ['name', 'age', 'bairro', 'zona', 'email', 'photo']
     const updates = {}
 
     allowed.forEach(field => {
       if (req.body[field] !== undefined) updates[field] = req.body[field]
     })
+
+    // Validação da foto (base64 ~5MB = ~7MB string)
+    if (updates.photo && updates.photo.length > 7 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Imagem muito grande. Máximo 5MB.' })
+    }
 
     // Validações
     if (updates.age && (updates.age < 13 || updates.age > 100)) {
