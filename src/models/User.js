@@ -16,6 +16,9 @@ const userSchema = new mongoose.Schema(
     teamId:    { type: String, default: '' },
     teamEmoji: { type: String, default: '' },
 
+    // Foto de perfil (base64 JPEG, max ~5MB)
+    photo: { type: String, default: null },
+
     // Stats (atualizadas pelo backend futuramente)
     grupos:             { type: Number, default: 0 },
     caronasOferecidas:  { type: Number, default: 0 },
