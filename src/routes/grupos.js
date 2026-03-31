@@ -1,8 +1,44 @@
-const express = require('express')
-const router  = express.Router()
-const Group   = require('../models/Group')
-const Message = require('../models/Message')
-const auth    = require('../middleware/auth')
+const express  = require('express')
+const mongoose = require('mongoose')
+const router   = express.Router()
+const Group    = require('../models/Group')
+const Message  = require('../models/Message')
+const auth     = require('../middleware/auth')
+
+// 🔒 NOVO — helper de sanitização anti-XSS
+function sanitize(str) {
+  if (typeof str !== 'string') return ''
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+}
+
+// 🔒 NOVO — middleware para validar ObjectId
+function validId(req, res, next) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    return res.status(400).json({ error: 'ID inválido' })
+  }
+  next()
+}
+
+// 🔒 NOVO — middleware para verificar se é membro do grupo
+async function requireMember(req, res, next) {
+  try {
+    const group = await Group.findById(req.params.id)
+    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
+
+    const isMember = group.members.map(String).includes(String(req.user.id))
+    if (!isMember) return res.status(403).json({ error: 'Você não é membro deste grupo' })
+
+    req.group = group // disponível nas rotas seguintes
+    next()
+  } catch (err) {
+    res.status(500).json({ error: 'Erro interno' })
+  }
+}
 
 // ─── POST /api/grupos — criar grupo ──────────────────────────────────────────
 router.post('/', auth, async (req, res) => {
@@ -13,24 +49,28 @@ router.post('/', auth, async (req, res) => {
     const existing = await Group.findOne({ leader: userId })
     if (existing) return res.status(400).json({ error: 'Você já é líder de um grupo.' })
 
+    // 🔒 MELHORADO — sanitizar inputs de texto
+    const cleanName = sanitize(name?.trim())
+    const cleanBairro = sanitize(bairro?.trim())
+    const cleanMeetPoint = sanitize(meetPoint?.trim())
+
     const duplicate = await Group.findOne({
-      name:   { $regex: new RegExp(`^${name.trim()}$`, 'i') },
+      name:   { $regex: new RegExp(`^${cleanName}$`, 'i') },
       team,
-      bairro: { $regex: new RegExp(`^${bairro.trim()}$`, 'i') },
+      bairro: { $regex: new RegExp(`^${cleanBairro}$`, 'i') },
     })
     if (duplicate) return res.status(400).json({ error: 'Já existe um grupo com esse nome para esse time e bairro.' })
 
     const group = await Group.create({
-      name: name.trim(), team, bairro: bairro.trim(), zona,
-      description: description?.trim() || '',
-      meetPoint: meetPoint.trim(),
+      name: cleanName, team, bairro: cleanBairro, zona,
+      description: sanitize(description?.trim() || ''),
+      meetPoint: cleanMeetPoint,
       privacy: privacy || 'public',
       approvalRequired: !!approvalRequired,
       leader: userId,
       members: [userId],
     })
 
-    // Mensagem de sistema de boas-vindas
     await Message.create({
       grupo: group._id, sender: userId,
       senderName: req.user.name || 'Líder',
@@ -41,7 +81,7 @@ router.post('/', auth, async (req, res) => {
     res.status(201).json({ group, message: 'Grupo criado com sucesso!' })
   } catch (err) {
     if (err.code === 11000) return res.status(400).json({ error: 'Grupo duplicado.' })
-    console.error('[POST /api/grupos]', err)
+    console.error('[POST /api/grupos]', err.message) // 🔒 Só err.message
     res.status(500).json({ error: 'Erro ao criar grupo' })
   }
 })
@@ -63,7 +103,7 @@ router.get('/', async (req, res) => {
 })
 
 // ─── GET /api/grupos/:id — detalhes ──────────────────────────────────────────
-router.get('/:id', async (req, res) => {
+router.get('/:id', validId, async (req, res) => {                    // 🔒 validId
   try {
     const group = await Group.findById(req.params.id).populate('leader', 'name handle')
     if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
@@ -74,7 +114,7 @@ router.get('/:id', async (req, res) => {
 })
 
 // ─── GET /api/grupos/:id/membros ──────────────────────────────────────────────
-router.get('/:id/membros', async (req, res) => {
+router.get('/:id/membros', validId, auth, requireMember, async (req, res) => {  // 🔒 validId + auth + requireMember
   try {
     const group = await Group.findById(req.params.id).populate('members', 'name handle')
     if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
@@ -85,9 +125,9 @@ router.get('/:id/membros', async (req, res) => {
 })
 
 // ─── GET /api/grupos/:id/mensagens ────────────────────────────────────────────
-router.get('/:id/mensagens', async (req, res) => {
+router.get('/:id/mensagens', validId, auth, requireMember, async (req, res) => {  // 🔒 validId + auth + requireMember
   try {
-    const limit  = parseInt(req.query.limit) || 50
+    const limit  = Math.min(parseInt(req.query.limit) || 50, 100)    // 🔒 Trava máximo em 100
     const skip   = parseInt(req.query.skip)  || 0
     const messages = await Message.find({ grupo: req.params.id })
       .sort({ createdAt: -1 })
@@ -101,28 +141,21 @@ router.get('/:id/mensagens', async (req, res) => {
 })
 
 // ─── POST /api/grupos/:id/mensagens ──────────────────────────────────────────
-router.post('/:id/mensagens', auth, async (req, res) => {
+router.post('/:id/mensagens', validId, auth, requireMember, async (req, res) => {  // 🔒 validId + requireMember (já tinha a checagem inline, agora é middleware)
   try {
     const { text } = req.body
     if (!text?.trim()) return res.status(400).json({ error: 'Mensagem vazia' })
 
-    const group = await Group.findById(req.params.id)
-    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
-
-    const isMember = group.members.map(String).includes(String(req.user.id))
-    if (!isMember) return res.status(403).json({ error: 'Você não é membro deste grupo' })
-
     const msg = await Message.create({
-      grupo:      group._id,
+      grupo:      req.group._id,                          // 🔒 Usa req.group do middleware
       sender:     req.user.id,
       senderName: req.user.name,
-      text:       text.trim(),
+      text:       sanitize(text.trim()),                  // 🔒 Sanitizar mensagem
       type:       'text',
     })
 
-    // Emitir via WebSocket (se disponível)
     if (req.app.locals.wsBroadcast) {
-      req.app.locals.wsBroadcast(group._id.toString(), {
+      req.app.locals.wsBroadcast(req.group._id.toString(), {
         type: 'message',
         data: { ...msg.toObject(), senderId: req.user.id },
       })
@@ -135,7 +168,7 @@ router.post('/:id/mensagens', auth, async (req, res) => {
 })
 
 // ─── POST /api/grupos/:id/entrar ──────────────────────────────────────────────
-router.post('/:id/entrar', auth, async (req, res) => {
+router.post('/:id/entrar', validId, auth, async (req, res) => {      // 🔒 validId
   try {
     const group = await Group.findById(req.params.id)
     if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
@@ -147,7 +180,6 @@ router.post('/:id/entrar', auth, async (req, res) => {
     group.members.push(req.user.id)
     await group.save()
 
-    // Mensagem de sistema
     const msg = await Message.create({
       grupo: group._id, sender: req.user.id,
       senderName: req.user.name,
@@ -169,7 +201,7 @@ router.post('/:id/entrar', auth, async (req, res) => {
 })
 
 // ─── DELETE /api/grupos/:id/sair ─────────────────────────────────────────────
-router.delete('/:id/sair', auth, async (req, res) => {
+router.delete('/:id/sair', validId, auth, async (req, res) => {      // 🔒 validId
   try {
     const group = await Group.findById(req.params.id)
     if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
