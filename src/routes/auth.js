@@ -7,7 +7,7 @@ const router = express.Router();
 
 // ─── Função para gerar JWT ───────────────────────────────────────────────
 function generateToken(userId) {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '30d' });
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '7d' }); // 🔒 Reduzido de 30d para 7d
 }
 
 // ─── POST /api/auth/register ─────────────────────────────────────────────
@@ -22,8 +22,8 @@ router.post('/register', async (req, res) => {
     if (age < 13 || age > 100) {
       return res.status(400).json({ error: 'Idade inválida' });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Senha deve ter no mínimo 6 caracteres' });
+    if (password.length < 8) { // 🔒 Aumentado de 6 para 8 caracteres
+      return res.status(400).json({ error: 'Senha deve ter no mínimo 8 caracteres' });
     }
 
     // Normalização
@@ -65,8 +65,8 @@ router.post('/register', async (req, res) => {
       user: user.toPublicJSON(),
     });
   } catch (err) {
-    console.error('[POST /register]', err.message, err.stack);
-    res.status(500).json({ error: 'Erro interno do servidor', details: err.message });
+    console.error('[POST /register]', err.message); // 🔒 Removido err.stack do log (Railway mostra nos logs internos)
+    res.status(500).json({ error: 'Erro interno do servidor' }); // 🔒 Removido details: err.message
   }
 });
 
@@ -97,8 +97,8 @@ router.post('/login', async (req, res) => {
       user: user.toPublicJSON(),
     });
   } catch (err) {
-    console.error('[POST /login]', err.message, err.stack);
-    res.status(500).json({ error: 'Erro interno do servidor', details: err.message });
+    console.error('[POST /login]', err.message); // 🔒 Removido err.stack
+    res.status(500).json({ error: 'Erro interno do servidor' }); // 🔒 Removido details
   }
 });
 
@@ -112,8 +112,8 @@ router.get('/check-handle/:handle', async (req, res) => {
     const existing = await User.findOne({ handle });
     res.json({ available: !existing, handle: `@${handle}` });
   } catch (err) {
-    console.error('[GET /check-handle]', err.message, err.stack);
-    res.status(500).json({ error: 'Erro interno do servidor', details: err.message });
+    console.error('[GET /check-handle]', err.message); // 🔒 Removido err.stack
+    res.status(500).json({ error: 'Erro interno do servidor' }); // 🔒 Removido details
   }
 });
 
