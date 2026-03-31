@@ -13,6 +13,7 @@ const profileRoutes = require('./routes/profile')
 const bsdProxy      = require('./routes/bsdProxy')
 const gruposRoutes  = require('./routes/grupos')
 const newsRoutes    = require('./routes/news')
+const Group         = require('./models/Group')      // 🔒 NOVO — para verificar membro no WebSocket
 
 const app    = express()
 const server = http.createServer(app)
@@ -22,8 +23,9 @@ const PORT   = process.env.PORT || 3001
 const wss   = new WebSocketServer({ server, path: '/ws/grupos' })
 const rooms = new Map()
 
-wss.on('connection', (ws, req) => {
-  // 🔒 NOVO — Validar JWT na conexão WebSocket
+wss.on('connection', async (ws, req) => {
+  // 🔒 Validar JWT na conexão WebSocket
+  let userId
   try {
     const url = new URL(req.url, `http://${req.headers.host}`)
     const token = url.searchParams.get('token')
@@ -34,7 +36,8 @@ wss.on('connection', (ws, req) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET)
-    ws.userId = decoded.id // armazena o userId no socket para uso futuro
+    userId = decoded.id
+    ws.userId = userId
   } catch (err) {
     ws.close(4001, 'Token inválido ou expirado')
     return
@@ -42,6 +45,24 @@ wss.on('connection', (ws, req) => {
 
   const grupoId = req.url.split('/ws/grupos/')[1]?.split('?')[0]
   if (!grupoId) return ws.close()
+
+  // 🔒 NOVO — Verificar se o usuário é membro do grupo
+  try {
+    const group = await Group.findById(grupoId)
+    if (!group) {
+      ws.close(4002, 'Grupo não encontrado')
+      return
+    }
+
+    const isMember = group.members.map(String).includes(String(userId))
+    if (!isMember) {
+      ws.close(4003, 'Você não é membro deste grupo')
+      return
+    }
+  } catch (err) {
+    ws.close(4002, 'Erro ao verificar grupo')
+    return
+  }
 
   if (!rooms.has(grupoId)) rooms.set(grupoId, new Set())
   rooms.get(grupoId).add(ws)
