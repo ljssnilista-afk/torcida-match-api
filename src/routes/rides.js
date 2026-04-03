@@ -363,6 +363,82 @@ router.post('/:id/confirm/passenger', validId, auth, async (req, res) => {
   }
 })
 
+// ─── PUT /api/rides/:id — motorista edita viagem ─────────────────────────────
+router.put('/:id', validId, auth, async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id)
+    if (!ride) return res.status(404).json({ error: 'Viagem não encontrada' })
+
+    if (String(ride.driver) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'Apenas o motorista pode editar' })
+    }
+
+    if (ride.status === 'completed' || ride.status === 'cancelled') {
+      return res.status(400).json({ error: 'Viagem finalizada não pode ser editada' })
+    }
+
+    const {
+      vehicle, totalSeats, price, memberPrice,
+      meetPoint, meetCoords, departureTime, bairro, zona,
+    } = req.body
+
+    // Validar veículo
+    if (vehicle) {
+      if (!['carro', 'van', 'onibus'].includes(vehicle)) {
+        return res.status(400).json({ error: 'Veículo inválido' })
+      }
+      // Van/ônibus: verificar se é líder
+      if (vehicle !== 'carro') {
+        const leaderGroup = await Group.findOne({ leader: req.user.id })
+        if (!leaderGroup) {
+          return res.status(403).json({ error: 'Apenas líderes podem usar van ou ônibus' })
+        }
+      }
+      ride.vehicle = vehicle
+    }
+
+    // Validar vagas (não pode reduzir abaixo dos passageiros ativos)
+    if (totalSeats != null) {
+      const activeCount = ride.passengers.filter(p => p.status !== 'cancelled').length
+      if (totalSeats < activeCount) {
+        return res.status(400).json({
+          error: `Não é possível reduzir para ${totalSeats} vagas. Há ${activeCount} passageiros confirmados.`
+        })
+      }
+      const maxSeats = { carro: 4, van: 15, onibus: 50 }
+      const veh = vehicle || ride.vehicle
+      if (totalSeats < 1 || totalSeats > maxSeats[veh]) {
+        return res.status(400).json({ error: `Vagas para ${veh}: 1 a ${maxSeats[veh]}` })
+      }
+      ride.totalSeats = totalSeats
+
+      // Atualizar status se necessário
+      if (activeCount >= totalSeats) ride.status = 'full'
+      else if (ride.status === 'full') ride.status = 'open'
+    }
+
+    if (price != null) {
+      if (price < 0) return res.status(400).json({ error: 'Preço inválido' })
+      ride.price = Math.round(price)
+    }
+    if (memberPrice !== undefined) {
+      ride.memberPrice = memberPrice != null ? Math.round(memberPrice) : null
+    }
+    if (meetPoint) ride.meetPoint = sanitize(meetPoint)
+    if (meetCoords) ride.meetCoords = meetCoords
+    if (departureTime) ride.departureTime = new Date(departureTime)
+    if (bairro !== undefined) ride.bairro = sanitize(bairro || '')
+    if (zona !== undefined) ride.zona = sanitize(zona || '')
+
+    await ride.save()
+
+    res.json({ message: 'Viagem atualizada com sucesso!', ride })
+  } catch (err) {
+    console.error('[PUT /api/rides/:id]', err.message)
+    res.status(500).json({ error: 'Erro ao editar viagem' })
+  }
+})
+
 // ─── DELETE /api/rides/:id — motorista cancela viagem ────────────────────────
 router.delete('/:id', validId, auth, async (req, res) => {
   try {
