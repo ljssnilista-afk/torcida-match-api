@@ -64,6 +64,9 @@ const RideSchema = new mongoose.Schema({
   releasedTotal:  { type: Number, default: 0 },          // total liberado pro motorista
   appCommission:  { type: Number, default: 0 },          // 20% retido pelo app
 
+  // 🆔 NOVO — código compartilhável (ex: V-48273)
+  shareCode:      { type: String, unique: true, sparse: true },
+
 }, { timestamps: true })
 
 // ─── Virtuals ─────────────────────────────────────
@@ -84,5 +87,21 @@ RideSchema.set('toObject', { virtuals: true })
 RideSchema.index({ 'game.date': 1, status: 1 })
 RideSchema.index({ driver: 1 })
 RideSchema.index({ zona: 1, bairro: 1 })
+RideSchema.index({ shareCode: 1 })
+
+// 🆔 Gerar shareCode único (V-XXXXX) antes de salvar
+RideSchema.pre('save', async function (next) {
+  if (this.shareCode) return next()
+
+  const Ride = mongoose.model('Ride')
+  let code, exists = true
+  while (exists) {
+    const num = String(Math.floor(10000 + Math.random() * 90000)) // 5 dígitos
+    code = `V-${num}`
+    exists = await Ride.findOne({ shareCode: code }).lean()
+  }
+  this.shareCode = code
+  next()
+})
 
 module.exports = mongoose.model('Ride', RideSchema)
