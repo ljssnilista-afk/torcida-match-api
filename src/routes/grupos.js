@@ -89,7 +89,15 @@ router.post('/', auth, async (req, res) => {
 // ─── GET /api/grupos — listar ─────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { team, bairro, zona } = req.query
+    const { team, bairro, zona, code } = req.query
+
+    // 🆔 Busca por código do grupo
+    if (code) {
+      const group = await Group.findOne({ code: code.padStart(7, '0') }).populate('leader', 'name handle')
+      if (!group) return res.status(404).json({ error: 'Grupo não encontrado com esse código' })
+      return res.json({ groups: [group], total: 1 })
+    }
+
     const filter = { privacy: 'public' }
     if (team)   filter.team   = { $regex: new RegExp(team, 'i') }
     if (bairro) filter.bairro = { $regex: new RegExp(bairro, 'i') }

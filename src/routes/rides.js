@@ -102,7 +102,18 @@ router.post('/', auth, async (req, res) => {
 // ─── GET /api/rides — listar viagens ─────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { team, zona, vehicle, status } = req.query
+    const { team, zona, vehicle, status, code } = req.query
+
+    // 🆔 Busca por código compartilhável
+    if (code) {
+      const ride = await Ride.findOne({ shareCode: code.toUpperCase() }).lean()
+      if (!ride) return res.status(404).json({ error: 'Viagem não encontrada com esse código' })
+      return res.json({ rides: [{
+        ...ride,
+        availableSeats: ride.totalSeats - ride.passengers.filter(p => p.status !== 'cancelled').length,
+      }], total: 1 })
+    }
+
     const filter = { status: status || 'open' }
 
     if (team) filter.$or = [
