@@ -1,6 +1,19 @@
 const mongoose = require('mongoose')
 const bcrypt = require('bcryptjs')
 
+const RideHistorySchema = new mongoose.Schema({
+  rideId:      { type: mongoose.Schema.Types.ObjectId },
+  homeTeam:    { type: String },
+  awayTeam:    { type: String },
+  gameDate:    { type: Date },
+  role:        { type: String, enum: ['motorista', 'passageiro'] },
+  vehicle:     { type: String },
+  paidAmount:  { type: Number, default: 0 },   // centavos
+  earned:      { type: Number, default: 0 },    // centavos (só motorista)
+  rating:      { type: Number, default: null },
+  completedAt: { type: Date, default: Date.now },
+}, { _id: false })
+
 const userSchema = new mongoose.Schema(
   {
     name:     { type: String, required: true, trim: true },
@@ -24,6 +37,9 @@ const userSchema = new mongoose.Schema(
     caronasOferecidas:  { type: Number, default: 0 },
     caronasPegadas:     { type: Number, default: 0 },
     avaliacaoMedia:     { type: Number, default: null },
+
+    // 🗑️ NOVO — histórico permanente de viagens (sobrevive à exclusão TTL)
+    rideHistory:        [RideHistorySchema],
 
     memberSince: { type: Date, default: Date.now },
   },

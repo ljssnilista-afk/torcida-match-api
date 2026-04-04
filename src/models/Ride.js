@@ -67,6 +67,9 @@ const RideSchema = new mongoose.Schema({
   // 🆔 NOVO — código compartilhável (ex: V-48273)
   shareCode:      { type: String, unique: true, sparse: true },
 
+  // 🗑️ TTL — exclusão automática 7 dias após o jogo
+  expiresAt:      { type: Date, default: null },
+
 }, { timestamps: true })
 
 // ─── Virtuals ─────────────────────────────────────
@@ -89,18 +92,28 @@ RideSchema.index({ driver: 1 })
 RideSchema.index({ zona: 1, bairro: 1 })
 RideSchema.index({ shareCode: 1 })
 
-// 🆔 Gerar shareCode único (V-XXXXX) antes de salvar
-RideSchema.pre('save', async function (next) {
-  if (this.shareCode) return next()
+// 🗑️ TTL index — MongoDB exclui automaticamente quando expiresAt é ultrapassado
+RideSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 })
 
-  const Ride = mongoose.model('Ride')
-  let code, exists = true
-  while (exists) {
-    const num = String(Math.floor(10000 + Math.random() * 90000)) // 5 dígitos
-    code = `V-${num}`
-    exists = await Ride.findOne({ shareCode: code }).lean()
+// 🆔 + 🗑️ Pre-save: gerar shareCode + calcular expiresAt
+RideSchema.pre('save', async function (next) {
+  // ShareCode
+  if (!this.shareCode) {
+    const Ride = mongoose.model('Ride')
+    let code, exists = true
+    while (exists) {
+      const num = String(Math.floor(10000 + Math.random() * 90000))
+      code = `V-${num}`
+      exists = await Ride.findOne({ shareCode: code }).lean()
+    }
+    this.shareCode = code
   }
-  this.shareCode = code
+
+  // ExpiresAt: 7 dias após a data do jogo
+  if (this.game?.date && !this.expiresAt) {
+    this.expiresAt = new Date(new Date(this.game.date).getTime() + 7 * 24 * 60 * 60 * 1000)
+  }
+
   next()
 })
 

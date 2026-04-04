@@ -15,14 +15,31 @@ const gruposRoutes  = require('./routes/grupos')
 const newsRoutes    = require('./routes/news')
 const ridesRoutes   = require('./routes/rides')         // 🚌 NOVO — marketplace de viagens
 const Group         = require('./models/Group')      // 🔒 NOVO — para verificar membro no WebSocket
+const Ride          = require('./models/Ride')       // 💬 NOVO — para verificar participante no chat de viagem
 
 const app    = express()
 const server = http.createServer(app)
 const PORT   = process.env.PORT || 3001
 
-// ─── WebSocket ────────────────────────────────────────────────────────────────
-const wss   = new WebSocketServer({ server, path: '/ws/grupos' })
+// ─── WebSocket — Grupos ───────────────────────────────────────────────────────
+const wss   = new WebSocketServer({ noServer: true })
 const rooms = new Map()
+
+// ─── WebSocket — Viagens ──────────────────────────────────────────────────────
+const wssRides   = new WebSocketServer({ noServer: true })
+const rideRooms  = new Map()
+
+// HTTP upgrade handler — roteia para o WebSocket correto
+server.on('upgrade', (req, socket, head) => {
+  const url = req.url || ''
+  if (url.startsWith('/ws/grupos/')) {
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req))
+  } else if (url.startsWith('/ws/rides/')) {
+    wssRides.handleUpgrade(req, socket, head, ws => wssRides.emit('connection', ws, req))
+  } else {
+    socket.destroy()
+  }
+})
 
 wss.on('connection', async (ws, req) => {
   // 🔒 Validar JWT na conexão WebSocket
@@ -77,6 +94,61 @@ wss.on('connection', async (ws, req) => {
 
 app.locals.wsBroadcast = (grupoId, payload) => {
   const clients = rooms.get(grupoId)
+  if (!clients) return
+  const data = JSON.stringify(payload)
+  for (const ws of clients) if (ws.readyState === 1) ws.send(data)
+}
+
+// ─── WebSocket Rides — conexão ────────────────────────────────────────────────
+wssRides.on('connection', async (ws, req) => {
+  // 🔒 Validar JWT
+  let userId
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`)
+    const token = url.searchParams.get('token')
+    if (!token) { ws.close(4001, 'Token não fornecido'); return }
+    const decoded = jwt.verify(token, process.env.JWT_SECRET)
+    userId = decoded.id
+    ws.userId = userId
+  } catch (err) {
+    ws.close(4001, 'Token inválido ou expirado')
+    return
+  }
+
+  const rideId = req.url.split('/ws/rides/')[1]?.split('?')[0]
+  if (!rideId) return ws.close()
+
+  // 🔒 Verificar se é motorista ou passageiro confirmado/pago
+  try {
+    const ride = await Ride.findById(rideId)
+    if (!ride) { ws.close(4002, 'Viagem não encontrada'); return }
+
+    const isDriver = String(ride.driver) === String(userId)
+    const isPassenger = ride.passengers.some(
+      p => String(p.user) === String(userId) && ['paid', 'confirmed'].includes(p.status)
+    )
+
+    if (!isDriver && !isPassenger) {
+      ws.close(4003, 'Apenas motorista e passageiros confirmados podem acessar o chat')
+      return
+    }
+  } catch (err) {
+    ws.close(4002, 'Erro ao verificar viagem')
+    return
+  }
+
+  if (!rideRooms.has(rideId)) rideRooms.set(rideId, new Set())
+  rideRooms.get(rideId).add(ws)
+
+  ws.on('close', () => {
+    rideRooms.get(rideId)?.delete(ws)
+    if (rideRooms.get(rideId)?.size === 0) rideRooms.delete(rideId)
+  })
+  ws.on('error', () => rideRooms.get(rideId)?.delete(ws))
+})
+
+app.locals.wsRideBroadcast = (rideId, payload) => {
+  const clients = rideRooms.get(rideId)
   if (!clients) return
   const data = JSON.stringify(payload)
   for (const ws of clients) if (ws.readyState === 1) ws.send(data)
