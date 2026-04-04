@@ -13,6 +13,9 @@ const GroupSchema = new mongoose.Schema({
   members:          [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   maxMembers:       { type: Number, default: 100 },
 
+  // 📸 Foto do grupo (base64, max 300KB)
+  photo:            { type: String, default: null },
+
   // 🆔 NOVO — código amigável de 7 dígitos (ex: 0000001)
   code:             { type: String, unique: true, sparse: true },
 
