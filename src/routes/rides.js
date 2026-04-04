@@ -3,6 +3,8 @@ const mongoose = require('mongoose')
 const router   = express.Router()
 const Ride     = require('../models/Ride')
 const Group    = require('../models/Group')
+const RideMessage = require('../models/RideMessage')
+const User     = require('../models/User')
 const auth     = require('../middleware/auth')
 
 // Helper: sanitizar texto
@@ -17,6 +19,47 @@ function validId(req, res, next) {
     return res.status(400).json({ error: 'ID inválido' })
   }
   next()
+}
+
+// 🗑️ Salvar histórico permanente no perfil de todos os participantes
+async function saveRideHistory(ride) {
+  try {
+    const baseEntry = {
+      rideId: ride._id,
+      homeTeam: ride.game.homeTeam,
+      awayTeam: ride.game.awayTeam,
+      gameDate: ride.game.date,
+      vehicle: ride.vehicle,
+      completedAt: new Date(),
+    }
+
+    // Motorista
+    await User.findByIdAndUpdate(ride.driver, {
+      $push: {
+        rideHistory: {
+          ...baseEntry,
+          role: 'motorista',
+          earned: ride.releasedTotal || 0,
+        }
+      }
+    })
+
+    // Passageiros confirmados
+    const confirmed = ride.passengers.filter(p => ['paid', 'confirmed'].includes(p.status))
+    for (const p of confirmed) {
+      await User.findByIdAndUpdate(p.user, {
+        $push: {
+          rideHistory: {
+            ...baseEntry,
+            role: 'passageiro',
+            paidAmount: p.paidAmount || 0,
+          }
+        }
+      })
+    }
+  } catch (err) {
+    console.error('[saveRideHistory]', err.message)
+  }
 }
 
 // ─── POST /api/rides — criar viagem ──────────────────────────────────────────
@@ -312,6 +355,9 @@ router.post('/:id/confirm/driver', validId, auth, async (req, res) => {
       const commission = Math.round(ride.escrowTotal * 0.20)
       ride.appCommission = commission
       ride.releasedTotal = ride.escrowTotal - commission
+
+      // 🗑️ Salvar histórico permanente antes do TTL excluir
+      await saveRideHistory(ride)
     } else {
       ride.status = 'in_progress'
     }
@@ -359,6 +405,9 @@ router.post('/:id/confirm/passenger', validId, auth, async (req, res) => {
       const commission = Math.round(ride.escrowTotal * 0.20)
       ride.appCommission = commission
       ride.releasedTotal = ride.escrowTotal - commission
+
+      // 🗑️ Salvar histórico permanente antes do TTL excluir
+      await saveRideHistory(ride)
     }
 
     await ride.save()
@@ -479,6 +528,77 @@ router.delete('/:id', validId, auth, async (req, res) => {
     res.json({ message: 'Viagem cancelada. Todos os passageiros foram reembolsados (simulado).', ride })
   } catch (err) {
     res.status(500).json({ error: 'Erro ao cancelar viagem' })
+  }
+})
+
+// ─── 💬 Chat da viagem ──────────────────────────────────────────────────────
+
+// Helper: verificar se pode acessar chat
+function canAccessRideChat(ride, userId) {
+  if (String(ride.driver) === String(userId)) return true
+  return ride.passengers.some(
+    p => String(p.user) === String(userId) && ['paid', 'confirmed'].includes(p.status)
+  )
+}
+
+// GET /api/rides/:id/messages — histórico de mensagens
+router.get('/:id/messages', validId, auth, async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id)
+    if (!ride) return res.status(404).json({ error: 'Viagem não encontrada' })
+
+    if (!canAccessRideChat(ride, req.user.id)) {
+      return res.status(403).json({ error: 'Apenas motorista e passageiros confirmados podem ver o chat' })
+    }
+
+    const messages = await RideMessage.find({ ride: req.params.id })
+      .sort({ createdAt: 1 })
+      .limit(100)
+      .lean()
+
+    res.json({ messages })
+  } catch (err) {
+    console.error('[GET /rides/:id/messages]', err.message)
+    res.status(500).json({ error: 'Erro ao buscar mensagens' })
+  }
+})
+
+// POST /api/rides/:id/messages — enviar mensagem
+router.post('/:id/messages', validId, auth, async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id)
+    if (!ride) return res.status(404).json({ error: 'Viagem não encontrada' })
+
+    if (!canAccessRideChat(ride, req.user.id)) {
+      return res.status(403).json({ error: 'Apenas motorista e passageiros confirmados podem enviar mensagens' })
+    }
+
+    const text = sanitize((req.body.text || '').trim())
+    if (!text || text.length > 1000) {
+      return res.status(400).json({ error: 'Mensagem inválida (1-1000 caracteres)' })
+    }
+
+    const message = await RideMessage.create({
+      ride: req.params.id,
+      sender: req.user.id,
+      senderName: req.user.name,
+      text,
+      type: 'text',
+      expiresAt: ride.expiresAt || null,
+    })
+
+    // Broadcast via WebSocket
+    if (req.app.locals.wsRideBroadcast) {
+      req.app.locals.wsRideBroadcast(req.params.id, {
+        type: 'ride-message',
+        message: message.toObject(),
+      })
+    }
+
+    res.status(201).json({ message: message.toObject() })
+  } catch (err) {
+    console.error('[POST /rides/:id/messages]', err.message)
+    res.status(500).json({ error: 'Erro ao enviar mensagem' })
   }
 })
 
