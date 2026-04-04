@@ -252,8 +252,8 @@ router.put('/:id', validId, auth, async (req, res) => {
         return res.status(400).json({ error: 'Formato de imagem inválido' })
       }
       const base64Data = updates.photo.split(',')[1]
-      if (!base64Data || Buffer.byteLength(base64Data, 'base64') > 300 * 1024) {
-        return res.status(400).json({ error: 'Imagem muito grande (máx 300KB)' })
+      if (!base64Data || Buffer.byteLength(base64Data, 'base64') > 800 * 1024) {
+        return res.status(400).json({ error: 'Imagem muito grande (máx 800KB)' })
       }
     }
 
