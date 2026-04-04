@@ -179,6 +179,9 @@ app.use(cors({
 app.use(express.json({ limit: '500kb' }))
 app.use(express.urlencoded({ extended: true, limit: '500kb' }))
 
+// 🔧 Trust proxy — necessário no Railway/Vercel para rate limiting funcionar
+app.set('trust proxy', 1)
+
 // ─── Rate Limiting ────────────────────────────────────────────────────────────
 // 🔒 NOVO — limite global: 100 requisições por minuto por IP
 const globalLimiter = rateLimit({
