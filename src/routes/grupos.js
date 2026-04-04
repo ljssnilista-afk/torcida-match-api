@@ -208,6 +208,68 @@ router.post('/:id/entrar', validId, auth, async (req, res) => {      // 🔒 val
   }
 })
 
+// ─── PUT /api/grupos/:id — líder edita grupo ────────────────────────────────
+router.put('/:id', validId, auth, async (req, res) => {
+  try {
+    const group = await Group.findById(req.params.id)
+    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
+
+    if (String(group.leader) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'Apenas o líder pode editar o grupo' })
+    }
+
+    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo']
+    const updates = {}
+
+    allowed.forEach(field => {
+      if (req.body[field] !== undefined) {
+        if (typeof req.body[field] === 'string' && field !== 'photo') {
+          updates[field] = sanitize(req.body[field])
+        } else {
+          updates[field] = req.body[field]
+        }
+      }
+    })
+
+    // Validações
+    if (updates.name !== undefined) {
+      updates.name = updates.name.trim()
+      if (updates.name.length < 3 || updates.name.length > 50) {
+        return res.status(400).json({ error: 'Nome deve ter entre 3 e 50 caracteres' })
+      }
+    }
+    if (updates.description !== undefined && updates.description.length > 140) {
+      return res.status(400).json({ error: 'Descrição deve ter no máximo 140 caracteres' })
+    }
+    if (updates.privacy && !['public', 'private'].includes(updates.privacy)) {
+      return res.status(400).json({ error: 'Privacidade inválida' })
+    }
+
+    // Validação de foto (mesma do perfil)
+    if (updates.photo) {
+      const validTypes = /^data:image\/(jpeg|jpg|png|webp);base64,/
+      if (!validTypes.test(updates.photo)) {
+        return res.status(400).json({ error: 'Formato de imagem inválido' })
+      }
+      const base64Data = updates.photo.split(',')[1]
+      if (!base64Data || Buffer.byteLength(base64Data, 'base64') > 300 * 1024) {
+        return res.status(400).json({ error: 'Imagem muito grande (máx 300KB)' })
+      }
+    }
+
+    const updated = await Group.findByIdAndUpdate(
+      req.params.id,
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).populate('leader', 'name handle')
+
+    res.json({ message: 'Grupo atualizado!', group: updated })
+  } catch (err) {
+    console.error('[PUT /api/grupos/:id]', err.message)
+    res.status(500).json({ error: 'Erro ao editar grupo' })
+  }
+})
+
 // ─── DELETE /api/grupos/:id/sair ─────────────────────────────────────────────
 router.delete('/:id/sair', validId, auth, async (req, res) => {      // 🔒 validId
   try {
