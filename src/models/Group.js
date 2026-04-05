@@ -13,6 +13,9 @@ const GroupSchema = new mongoose.Schema({
   members:          [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   maxMembers:       { type: Number, default: 100 },
 
+  // 🏷️ Tipo/categoria do grupo
+  groupType:        { type: String, enum: ['misto', 'organizada', 'familia', 'feminino', 'jovem'], default: 'misto' },
+
   // 📸 Foto do grupo (base64, max 300KB)
   photo:            { type: String, default: null },
 
