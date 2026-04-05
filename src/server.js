@@ -14,6 +14,7 @@ const bsdProxy      = require('./routes/bsdProxy')
 const gruposRoutes  = require('./routes/grupos')
 const newsRoutes    = require('./routes/news')
 const ridesRoutes   = require('./routes/rides')         // 🚌 NOVO — marketplace de viagens
+const invitesRoutes = require('./routes/invites')       // 📩 NOVO — convites
 const Group         = require('./models/Group')      // 🔒 NOVO — para verificar membro no WebSocket
 const Ride          = require('./models/Ride')       // 💬 NOVO — para verificar participante no chat de viagem
 
@@ -214,6 +215,7 @@ app.use('/api/bsd',     bsdProxy)
 app.use('/api/grupos',  gruposRoutes)
 app.use('/api/news',    newsRoutes)
 app.use('/api/rides',   ridesRoutes)                    // 🚌 NOVO — marketplace de viagens
+app.use('/api/invites', invitesRoutes)                  // 📩 NOVO — convites
 
 app.get('/health', (req, res) =>
   res.json({ status: 'ok', app: 'TorcidaMatch API', time: new Date().toISOString() }))
