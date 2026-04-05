@@ -43,7 +43,7 @@ async function requireMember(req, res, next) {
 // ─── POST /api/grupos — criar grupo ──────────────────────────────────────────
 router.post('/', auth, async (req, res) => {
   try {
-    const { name, team, bairro, zona, description, meetPoint, privacy, approvalRequired } = req.body
+    const { name, team, bairro, zona, description, meetPoint, privacy, approvalRequired, groupType } = req.body
     const userId = req.user.id
 
     const existing = await Group.findOne({ leader: userId })
@@ -67,6 +67,7 @@ router.post('/', auth, async (req, res) => {
       meetPoint: cleanMeetPoint,
       privacy: privacy || 'public',
       approvalRequired: !!approvalRequired,
+      groupType: ['misto','organizada','familia','feminino','jovem'].includes(groupType) ? groupType : 'misto',
       leader: userId,
       members: [userId],
     })
@@ -218,7 +219,7 @@ router.put('/:id', validId, auth, async (req, res) => {
       return res.status(403).json({ error: 'Apenas o líder pode editar o grupo' })
     }
 
-    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo']
+    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo', 'groupType']
     const updates = {}
 
     allowed.forEach(field => {
@@ -243,6 +244,9 @@ router.put('/:id', validId, auth, async (req, res) => {
     }
     if (updates.privacy && !['public', 'private'].includes(updates.privacy)) {
       return res.status(400).json({ error: 'Privacidade inválida' })
+    }
+    if (updates.groupType && !['misto', 'organizada', 'familia', 'feminino', 'jovem'].includes(updates.groupType)) {
+      return res.status(400).json({ error: 'Tipo de grupo inválido' })
     }
 
     // Validação de foto (mesma do perfil)
