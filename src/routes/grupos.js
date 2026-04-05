@@ -177,23 +177,56 @@ router.post('/:id/mensagens', validId, auth, requireMember, async (req, res) => 
 })
 
 // ─── POST /api/grupos/:id/entrar ──────────────────────────────────────────────
-router.post('/:id/entrar', validId, auth, async (req, res) => {      // 🔒 validId
+router.post('/:id/entrar', validId, auth, async (req, res) => {
   try {
     const group = await Group.findById(req.params.id)
     if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
-    if (group.members.length >= group.maxMembers) return res.status(400).json({ error: 'Grupo cheio' })
 
-    const already = group.members.map(String).includes(String(req.user.id))
+    const userId = String(req.user.id)
+    const already = group.members.map(String).includes(userId)
     if (already) return res.status(400).json({ error: 'Você já é membro' })
 
+    // Verificar se já está pendente
+    const alreadyPending = group.pendingMembers?.some(p => String(p.user) === userId)
+    if (alreadyPending) return res.status(400).json({ error: 'Solicitação já enviada, aguarde' })
+
+    if (group.members.length >= group.maxMembers) return res.status(400).json({ error: 'Grupo cheio' })
+
+    // ── GRUPO PÚBLICO: líder precisa aprovar ──
+    if (group.privacy === 'public') {
+      group.pendingMembers.push({
+        user: req.user.id,
+        name: req.user.name,
+        handle: req.user.handle || '',
+        status: 'pendingApproval',
+      })
+      await group.save()
+      return res.json({ message: 'Solicitação enviada! O líder precisa aprovar sua entrada.', status: 'pendingApproval' })
+    }
+
+    // ── GRUPO PRIVADO: entrada direta, mas precisa pagar ──
+    if (group.membershipFee > 0) {
+      group.pendingMembers.push({
+        user: req.user.id,
+        name: req.user.name,
+        handle: req.user.handle || '',
+        status: 'pendingPayment',
+      })
+      await group.save()
+      return res.json({
+        message: `Entrada confirmada! Pague a mensalidade de R$ ${(group.membershipFee / 100).toFixed(2).replace('.', ',')} para acessar o grupo.`,
+        status: 'pendingPayment',
+        fee: group.membershipFee,
+      })
+    }
+
+    // ── GRUPO PRIVADO GRATUITO: entrada direta ──
     group.members.push(req.user.id)
     await group.save()
 
-    const msg = await Message.create({
-      grupo: group._id, sender: req.user.id,
-      senderName: req.user.name,
-      text: `${req.user.name} entrou no grupo`,
-      type: 'system',
+    await Message.create({
+      grupo: group._id, sender: req.user.id, senderName: req.user.name,
+      text: `${req.user.name} entrou no grupo`, type: 'system',
     })
 
     if (req.app.locals.wsBroadcast) {
@@ -203,9 +236,95 @@ router.post('/:id/entrar', validId, auth, async (req, res) => {      // 🔒 val
       })
     }
 
-    res.json({ message: 'Entrou no grupo!', group })
+    res.json({ message: 'Entrou no grupo!', status: 'active', group })
   } catch (err) {
+    console.error('[POST /grupos/:id/entrar]', err.message)
     res.status(500).json({ error: 'Erro ao entrar no grupo' })
+  }
+})
+
+// ─── POST /api/grupos/:id/approve/:userId — líder aprova membro ──────────────
+router.post('/:id/approve/:userId', validId, auth, async (req, res) => {
+  try {
+    const group = await Group.findById(req.params.id)
+    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
+    if (String(group.leader) !== String(req.user.id)) return res.status(403).json({ error: 'Apenas o líder pode aprovar' })
+
+    const pending = group.pendingMembers?.find(p => String(p.user) === req.params.userId)
+    if (!pending) return res.status(404).json({ error: 'Solicitação não encontrada' })
+
+    // Se tem mensalidade, mudar para pendingPayment
+    if (group.membershipFee > 0) {
+      pending.status = 'pendingPayment'
+      await group.save()
+      return res.json({ message: 'Aprovado! Membro precisa pagar a mensalidade.', status: 'pendingPayment' })
+    }
+
+    // Sem mensalidade: ativar direto
+    group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== req.params.userId)
+    group.members.push(req.params.userId)
+    await group.save()
+
+    await Message.create({
+      grupo: group._id, sender: req.params.userId, senderName: pending.name,
+      text: `${pending.name} entrou no grupo`, type: 'system',
+    })
+
+    res.json({ message: `${pending.name} aprovado e adicionado ao grupo!`, status: 'active' })
+  } catch (err) {
+    console.error('[POST /grupos/:id/approve]', err.message)
+    res.status(500).json({ error: 'Erro ao aprovar membro' })
+  }
+})
+
+// ─── POST /api/grupos/:id/reject/:userId — líder rejeita membro ─────────────
+router.post('/:id/reject/:userId', validId, auth, async (req, res) => {
+  try {
+    const group = await Group.findById(req.params.id)
+    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
+    if (String(group.leader) !== String(req.user.id)) return res.status(403).json({ error: 'Apenas o líder pode rejeitar' })
+
+    group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== req.params.userId)
+    await group.save()
+
+    res.json({ message: 'Solicitação rejeitada.' })
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao rejeitar' })
+  }
+})
+
+// ─── POST /api/grupos/:id/pay — membro confirma pagamento (simulado) ─────────
+router.post('/:id/pay', validId, auth, async (req, res) => {
+  try {
+    const group = await Group.findById(req.params.id)
+    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
+
+    const pending = group.pendingMembers?.find(
+      p => String(p.user) === String(req.user.id) && p.status === 'pendingPayment'
+    )
+    if (!pending) return res.status(400).json({ error: 'Nenhum pagamento pendente encontrado' })
+
+    // Simular pagamento aprovado → ativar membro
+    group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== String(req.user.id))
+    group.members.push(req.user.id)
+    await group.save()
+
+    await Message.create({
+      grupo: group._id, sender: req.user.id, senderName: req.user.name,
+      text: `${req.user.name} entrou no grupo (pagamento confirmado)`, type: 'system',
+    })
+
+    if (req.app.locals.wsBroadcast) {
+      req.app.locals.wsBroadcast(group._id.toString(), {
+        type: 'member_joined',
+        data: { _id: req.user.id, name: req.user.name, handle: req.user.handle },
+      })
+    }
+
+    res.json({ message: 'Pagamento confirmado! Você agora é membro ativo.', status: 'active' })
+  } catch (err) {
+    console.error('[POST /grupos/:id/pay]', err.message)
+    res.status(500).json({ error: 'Erro ao processar pagamento' })
   }
 })
 
@@ -219,7 +338,7 @@ router.put('/:id', validId, auth, async (req, res) => {
       return res.status(403).json({ error: 'Apenas o líder pode editar o grupo' })
     }
 
-    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo', 'groupType']
+    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo', 'groupType', 'membershipFee']
     const updates = {}
 
     allowed.forEach(field => {
