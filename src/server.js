@@ -165,10 +165,10 @@ app.use(cors({
       process.env.CLIENT_URL,
       'http://localhost:5173',
       'http://localhost:3000',
+      'https://torcidamatch.vercel.app',
     ]
-    // 🔒 MELHORADO — removido wildcard *.vercel.app e *.railway.app
-    // Só permite seu domínio específico + localhost
-    if (!origin || allowed.includes(origin)) cb(null, true)
+    // Permitir também subdomínios Vercel (previews de deploy)
+    if (!origin || allowed.includes(origin) || origin?.endsWith('.vercel.app')) cb(null, true)
     else cb(new Error('Bloqueado pelo CORS'))
   },
   credentials: true,
