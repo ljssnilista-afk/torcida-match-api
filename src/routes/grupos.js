@@ -3,6 +3,7 @@ const mongoose = require('mongoose')
 const router   = express.Router()
 const Group    = require('../models/Group')
 const Message  = require('../models/Message')
+const Notification = require('../models/Notification')
 const auth     = require('../middleware/auth')
 
 // 🔒 NOVO — helper de sanitização anti-XSS
@@ -201,6 +202,18 @@ router.post('/:id/entrar', validId, auth, async (req, res) => {
         status: 'pendingApproval',
       })
       await group.save()
+
+      // Notificar o líder
+      await Notification.create({
+        user: group.leader,
+        type: 'group_join_request',
+        title: 'Nova solicitação de entrada',
+        message: `${req.user.name} quer entrar no grupo ${group.name}`,
+        group: group._id,
+        fromUser: req.user.id,
+        fromName: req.user.name,
+      })
+
       return res.json({ message: 'Solicitação enviada! O líder precisa aprovar sua entrada.', status: 'pendingApproval' })
     }
 
@@ -257,6 +270,17 @@ router.post('/:id/approve/:userId', validId, auth, async (req, res) => {
     if (group.membershipFee > 0) {
       pending.status = 'pendingPayment'
       await group.save()
+
+      await Notification.create({
+        user: req.params.userId,
+        type: 'group_payment_pending',
+        title: 'Entrada aprovada!',
+        message: `Sua entrada no grupo ${group.name} foi aprovada. Pague a mensalidade para acessar.`,
+        group: group._id,
+        fromUser: req.user.id,
+        fromName: req.user.name,
+      })
+
       return res.json({ message: 'Aprovado! Membro precisa pagar a mensalidade.', status: 'pendingPayment' })
     }
 
@@ -264,6 +288,16 @@ router.post('/:id/approve/:userId', validId, auth, async (req, res) => {
     group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== req.params.userId)
     group.members.push(req.params.userId)
     await group.save()
+
+    await Notification.create({
+      user: req.params.userId,
+      type: 'group_approved',
+      title: 'Entrada aprovada!',
+      message: `Você foi aceito no grupo ${group.name}. Bem-vindo!`,
+      group: group._id,
+      fromUser: req.user.id,
+      fromName: req.user.name,
+    })
 
     await Message.create({
       grupo: group._id, sender: req.params.userId, senderName: pending.name,
@@ -286,6 +320,16 @@ router.post('/:id/reject/:userId', validId, auth, async (req, res) => {
 
     group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== req.params.userId)
     await group.save()
+
+    await Notification.create({
+      user: req.params.userId,
+      type: 'group_rejected',
+      title: 'Solicitação recusada',
+      message: `Sua solicitação para o grupo ${group.name} foi recusada.`,
+      group: group._id,
+      fromUser: req.user.id,
+      fromName: req.user.name,
+    })
 
     res.json({ message: 'Solicitação rejeitada.' })
   } catch (err) {
