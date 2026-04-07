@@ -100,7 +100,7 @@ router.get('/', async (req, res) => {
       return res.json({ groups: [group], total: 1 })
     }
 
-    const filter = { privacy: 'public' }
+    const filter = {}
     if (team)   filter.team   = { $regex: new RegExp(team, 'i') }
     if (bairro) filter.bairro = { $regex: new RegExp(bairro, 'i') }
     if (zona)   filter.zona   = zona
