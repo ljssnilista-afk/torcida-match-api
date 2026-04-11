@@ -36,6 +36,12 @@ const GroupSchema = new mongoose.Schema({
   // 📸 Foto do grupo (base64, max 800KB)
   photo:            { type: String, default: null },
 
+  // 📍 Localização do ponto de encontro
+  location: {
+    lat: { type: Number, default: null },
+    lng: { type: Number, default: null },
+  },
+
   // 🆔 Código amigável de 7 dígitos (ex: 0000001)
   code:             { type: String, unique: true, sparse: true },
 
