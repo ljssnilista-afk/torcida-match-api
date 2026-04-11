@@ -382,7 +382,7 @@ router.put('/:id', validId, auth, async (req, res) => {
       return res.status(403).json({ error: 'Apenas o líder pode editar o grupo' })
     }
 
-    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo', 'groupType', 'membershipFee']
+    const allowed = ['name', 'description', 'bairro', 'zona', 'meetPoint', 'privacy', 'approvalRequired', 'photo', 'groupType', 'membershipFee', 'location']
     const updates = {}
 
     allowed.forEach(field => {
@@ -410,6 +410,13 @@ router.put('/:id', validId, auth, async (req, res) => {
     }
     if (updates.groupType && !['misto', 'organizada', 'familia', 'feminino', 'jovem'].includes(updates.groupType)) {
       return res.status(400).json({ error: 'Tipo de grupo inválido' })
+    }
+
+    // Validação de localização
+    if (updates.location) {
+      if (typeof updates.location.lat !== 'number' || typeof updates.location.lng !== 'number') {
+        return res.status(400).json({ error: 'Coordenadas inválidas' })
+      }
     }
 
     // Validação de foto (mesma do perfil)
