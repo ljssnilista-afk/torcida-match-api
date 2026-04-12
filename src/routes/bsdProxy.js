@@ -29,11 +29,39 @@ router.get('/*', async (req, res) => {
       return res.send(Buffer.from(buffer))
     }
 
+    // Valida se a resposta é JSON antes de parsear
+    const contentType = response.headers.get('content-type') || ''
+
+    if (!response.ok) {
+      const body = await response.text()
+      console.error(`[BSD Proxy] HTTP ${response.status} para ${url}`)
+      console.error(`[BSD Proxy] Content-Type: ${contentType}`)
+      console.error(`[BSD Proxy] Body (primeiros 200 chars): ${body.substring(0, 200)}`)
+      return res.status(response.status).json({
+        error: `BSD API retornou ${response.status}`,
+        upstream_status: response.status,
+      })
+    }
+
+    if (!contentType.includes('application/json')) {
+      const body = await response.text()
+      console.error(`[BSD Proxy] Resposta não-JSON para ${url}`)
+      console.error(`[BSD Proxy] Content-Type: ${contentType}`)
+      console.error(`[BSD Proxy] Body (primeiros 200 chars): ${body.substring(0, 200)}`)
+      return res.status(502).json({
+        error: 'BSD API retornou resposta não-JSON (possível manutenção ou bloqueio)',
+        upstream_content_type: contentType,
+      })
+    }
+
     const data = await response.json()
     res.status(response.status).json(data)
   } catch (err) {
-    console.error('[BSD Proxy]', err.message)
-    res.status(500).json({ error: 'Erro ao consultar BSD API' })
+    const isTimeout = err.name === 'TimeoutError' || err.name === 'AbortError'
+    console.error('[BSD Proxy]', isTimeout ? 'Timeout (8s)' : err.message)
+    res.status(isTimeout ? 504 : 500).json({
+      error: isTimeout ? 'BSD API não respondeu a tempo' : 'Erro ao consultar BSD API'
+    })
   }
 })
 
