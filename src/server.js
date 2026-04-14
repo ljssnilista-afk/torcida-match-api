@@ -17,6 +17,8 @@ const ridesRoutes   = require('./routes/rides')         // 🚌 NOVO — marketp
 const invitesRoutes = require('./routes/invites')       // 📩 NOVO — convites
 const notificationsRoutes = require('./routes/notifications') // 🔔 NOVO — notificações
 const footballDataRoutes  = require('./routes/footballData')   // ⚽ NOVO — football-data.org v4
+const paymentsRoutes = require('./routes/payments')     // 💳 NOVO — Stripe PaymentIntents
+const webhookRoutes  = require('./routes/webhook')      // 💳 NOVO — Stripe Webhooks
 const Group         = require('./models/Group')      // 🔒 NOVO — para verificar membro no WebSocket
 const Ride          = require('./models/Ride')       // 💬 NOVO — para verificar participante no chat de viagem
 
@@ -178,6 +180,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }))
 
+// 💳 WEBHOOK — deve vir ANTES do express.json() (precisa do body raw/Buffer)
+app.use('/api/webhook', express.raw({ type: 'application/json' }), webhookRoutes)
+
 // 🔒 MELHORADO — body parser com limite de tamanho
 app.use(express.json({ limit: '500kb' }))
 app.use(express.urlencoded({ extended: true, limit: '500kb' }))
@@ -220,6 +225,7 @@ app.use('/api/rides',   ridesRoutes)                    // 🚌 NOVO — marketp
 app.use('/api/invites', invitesRoutes)                  // 📩 NOVO — convites
 app.use('/api/notifications', notificationsRoutes)     // 🔔 NOVO — notificações
 app.use('/api/football',      footballDataRoutes)       // ⚽ NOVO — football-data.org v4
+app.use('/api/payments',      paymentsRoutes)            // 💳 NOVO — Stripe PaymentIntents
 
 app.get('/health', (req, res) =>
   res.json({ status: 'ok', app: 'TorcidaMatch API', time: new Date().toISOString() }))
