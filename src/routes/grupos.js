@@ -445,16 +445,85 @@ router.put('/:id', validId, auth, async (req, res) => {
 })
 
 // ─── DELETE /api/grupos/:id/sair ─────────────────────────────────────────────
-router.delete('/:id/sair', validId, auth, async (req, res) => {      // 🔒 validId
+router.delete('/:id/sair', validId, auth, async (req, res) => {
   try {
     const group = await Group.findById(req.params.id)
     if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
 
-    group.members = group.members.filter(m => String(m) !== String(req.user.id))
+    const userId = String(req.user.id)
+    const isLeader = String(group.leader) === userId
+
+    // Líder não pode sair sem transferir liderança ou excluir o grupo
+    if (isLeader) {
+      return res.status(400).json({
+        error: 'Você é o líder deste grupo. Transfira a liderança para outro membro ou exclua o grupo antes de sair.',
+        code: 'LEADER_CANNOT_LEAVE',
+      })
+    }
+
+    group.members = group.members.filter(m => String(m) !== userId)
     await group.save()
+
+    await Message.create({
+      grupo: group._id, sender: req.user.id, senderName: req.user.name,
+      text: `${req.user.name} saiu do grupo`, type: 'system',
+    })
+
     res.json({ message: 'Você saiu do grupo' })
   } catch (err) {
     res.status(500).json({ error: 'Erro ao sair do grupo' })
+  }
+})
+
+// ─── POST /api/grupos/:id/transfer/:userId — transferir liderança ───────────
+router.post('/:id/transfer/:userId', validId, auth, async (req, res) => {
+  try {
+    const group = await Group.findById(req.params.id)
+    if (!group) return res.status(404).json({ error: 'Grupo não encontrado' })
+
+    if (String(group.leader) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'Apenas o líder pode transferir a liderança' })
+    }
+
+    const newLeaderId = req.params.userId
+    const isMember = group.members.map(String).includes(newLeaderId)
+    if (!isMember) {
+      return res.status(400).json({ error: 'O novo líder precisa ser membro do grupo' })
+    }
+
+    if (String(newLeaderId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'Você já é o líder' })
+    }
+
+    const oldLeaderName = req.user.name
+    group.leader = newLeaderId
+    await group.save()
+
+    // Buscar nome do novo líder
+    const User = require('../models/User')
+    const newLeader = await User.findById(newLeaderId).select('name')
+
+    await Message.create({
+      grupo: group._id, sender: req.user.id, senderName: oldLeaderName,
+      text: `${oldLeaderName} transferiu a liderança para ${newLeader?.name || 'novo líder'}`,
+      type: 'system',
+    })
+
+    // Notificar novo líder
+    await Notification.create({
+      user: newLeaderId,
+      type: 'group_leadership_transfer',
+      title: 'Você é o novo líder!',
+      message: `${oldLeaderName} transferiu a liderança do grupo ${group.name} para você.`,
+      group: group._id,
+      fromUser: req.user.id,
+      fromName: oldLeaderName,
+    })
+
+    res.json({ message: `Liderança transferida para ${newLeader?.name || 'novo líder'}` })
+  } catch (err) {
+    console.error('[POST /grupos/:id/transfer]', err.message)
+    res.status(500).json({ error: 'Erro ao transferir liderança' })
   }
 })
 
