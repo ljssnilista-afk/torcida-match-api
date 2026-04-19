@@ -221,32 +221,29 @@ router.post('/:id/entrar', validId, auth, async (req, res) => {
       })
     }
 
-    // ── PRIVADO ──
+    // ── PRIVADO — sempre exige pagamento ──
     if (group.privacy === 'private') {
-      // Se tem mensalidade >= R$ 1,00: pendingPayment
-      if (group.membershipFee >= 100) {
-        group.pendingMembers.push({
-          user:   req.user.id,
-          name:   req.user.name,
-          handle: req.user.handle || '',
-          status: 'pendingPayment',
-        })
-        await group.save()
-
-        return res.json({
-          message: `Pague a mensalidade de R$ ${(group.membershipFee / 100).toFixed(2).replace('.', ',')} para entrar no grupo.`,
-          status:  'pendingPayment',
-          fee:     group.membershipFee,
+      // Grupo privado SEMPRE requer pagamento (mínimo R$ 1,00)
+      // Se membershipFee não foi definido corretamente, bloqueia a entrada
+      if (group.membershipFee < 100) {
+        return res.status(400).json({
+          error: 'Este grupo privado não tem mensalidade configurada. Peça ao líder para definir o valor.',
+          status: 'error',
         })
       }
 
-      // Privado sem mensalidade: entrada direta
-      group.members.push(req.user.id)
+      group.pendingMembers.push({
+        user:   req.user.id,
+        name:   req.user.name,
+        handle: req.user.handle || '',
+        status: 'pendingPayment',
+      })
       await group.save()
 
       return res.json({
-        message: 'Você entrou no grupo!',
-        status: 'joined',
+        message: `Pague a mensalidade de R$ ${(group.membershipFee / 100).toFixed(2).replace('.', ',')} para entrar no grupo.`,
+        status:  'pendingPayment',
+        fee:     group.membershipFee,
       })
     }
   } catch (err) {
