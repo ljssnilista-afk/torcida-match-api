@@ -102,6 +102,59 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// ─── POST /api/auth/refresh ──────────────────────────────────────────────
+// Renova o token se ainda for válido (ou expirado há menos de 7 dias)
+router.post('/refresh', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Token não fornecido' })
+    }
+
+    const token = authHeader.split(' ')[1]
+    let decoded
+
+    try {
+      // Tenta verificar normalmente (token ainda válido)
+      decoded = jwt.verify(token, process.env.JWT_SECRET)
+    } catch (err) {
+      // Se expirou, decodifica sem verificar expiração para checar a janela de graça
+      if (err.name === 'TokenExpiredError') {
+        decoded = jwt.decode(token)
+        if (!decoded?.id) {
+          return res.status(401).json({ error: 'Token inválido' })
+        }
+        // Janela de graça: permite renovar até 7 dias após expiração
+        const expiredAt = decoded.exp * 1000
+        const gracePeriod = 7 * 24 * 60 * 60 * 1000 // 7 dias
+        if (Date.now() - expiredAt > gracePeriod) {
+          return res.status(401).json({ error: 'Token expirado além do período de renovação. Faça login novamente.' })
+        }
+      } else {
+        return res.status(401).json({ error: 'Token inválido' })
+      }
+    }
+
+    // Verifica se o usuário ainda existe
+    const user = await User.findById(decoded.id).select('-password')
+    if (!user) {
+      return res.status(401).json({ error: 'Usuário não encontrado' })
+    }
+
+    // Gera novo token
+    const newToken = generateToken(user._id)
+
+    res.json({
+      message: 'Token renovado com sucesso',
+      token: newToken,
+      user: user.toPublicJSON(),
+    })
+  } catch (err) {
+    console.error('[POST /refresh]', err.message)
+    res.status(500).json({ error: 'Erro interno do servidor' })
+  }
+})
+
 // ─── GET /api/auth/check-handle/:handle ─────────────────────────────────
 router.get('/check-handle/:handle', async (req, res) => {
   try {
