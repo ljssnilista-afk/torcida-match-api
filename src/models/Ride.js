@@ -1,14 +1,20 @@
 const mongoose = require('mongoose')
 
 const PassengerSchema = new mongoose.Schema({
-  user:           { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  name:           { type: String, required: true },
-  handle:         { type: String, default: '' },
-  status:         { type: String, enum: ['reserved', 'paid', 'confirmed', 'cancelled'], default: 'reserved' },
-  paidAmount:     { type: Number, default: 0 },         // quanto pagou (simulado)
-  isMember:       { type: Boolean, default: false },     // era membro do grupo do motorista?
-  confirmedAt:    { type: Date, default: null },         // quando o passageiro confirmou a viagem
-  reservedAt:     { type: Date, default: Date.now },
+  user:             { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  name:             { type: String, required: true },
+  handle:           { type: String, default: '' },
+  status:           { type: String, enum: ['reserved', 'paid', 'confirmed', 'cancelled'], default: 'reserved' },
+  paidAmount:       { type: Number, default: 0 },         // quanto pagou (simulado)
+  isMember:         { type: Boolean, default: false },     // era membro do grupo do motorista?
+  confirmedAt:      { type: Date, default: null },         // quando o passageiro confirmou a viagem
+  reservedAt:       { type: Date, default: Date.now },
+
+  // ─── Volta condicional ───────────────────────────────────────────────────────
+  // null = motorista ainda não avaliou | true = aprovado para volta | false = reprovado
+  returnApproved:   { type: Boolean, default: null },
+  returnNote:       { type: String, default: '' },         // comentário opcional do motorista
+  returnEvaluatedAt:{ type: Date, default: null },
 })
 
 const RideSchema = new mongoose.Schema({

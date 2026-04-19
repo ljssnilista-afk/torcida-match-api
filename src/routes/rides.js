@@ -531,6 +531,51 @@ router.delete('/:id', validId, auth, async (req, res) => {
   }
 })
 
+// ─── PATCH /api/rides/:id/passengers/:passengerId/return — motorista avalia volta ─
+// Body: { approved: Boolean, note?: String }
+router.patch('/:id/passengers/:passengerId/return', validId, auth, async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id)
+    if (!ride) return res.status(404).json({ error: 'Viagem não encontrada' })
+
+    // Só o motorista pode avaliar
+    if (String(ride.driver) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'Apenas o motorista pode avaliar a volta' })
+    }
+
+    // Viagem precisa estar concluída ou em andamento
+    if (!['in_progress', 'completed'].includes(ride.status)) {
+      return res.status(400).json({ error: 'A avaliação de volta só pode ser feita após o início da viagem' })
+    }
+
+    const passenger = ride.passengers.id(req.params.passengerId)
+    if (!passenger || passenger.status === 'cancelled') {
+      return res.status(404).json({ error: 'Passageiro não encontrado nesta viagem' })
+    }
+
+    const { approved, note = '' } = req.body
+    if (typeof approved !== 'boolean') {
+      return res.status(400).json({ error: 'Campo "approved" deve ser true ou false' })
+    }
+
+    passenger.returnApproved    = approved
+    passenger.returnNote        = String(note).slice(0, 200)
+    passenger.returnEvaluatedAt = new Date()
+
+    await ride.save()
+
+    res.json({
+      message: approved
+        ? `${passenger.name} aprovado(a) para a volta! 🎉`
+        : `${passenger.name} não terá vaga garantida na volta.`,
+      passenger,
+    })
+  } catch (err) {
+    console.error('[PATCH /rides/:id/passengers/:passengerId/return]', err.message)
+    res.status(500).json({ error: 'Erro ao avaliar volta do passageiro' })
+  }
+})
+
 // ─── 💬 Chat da viagem ──────────────────────────────────────────────────────
 
 // Helper: verificar se pode acessar chat
