@@ -1,9 +1,11 @@
-const express    = require('express')
-const mongoose   = require('mongoose')
-const rateLimit  = require('express-rate-limit')
-const auth       = require('../middleware/auth')
-const Group      = require('../models/Group')
-const Ride       = require('../models/Ride')
+const express      = require('express')
+const mongoose     = require('mongoose')
+const rateLimit    = require('express-rate-limit')
+const auth         = require('../middleware/auth')
+const Group        = require('../models/Group')
+const Ride         = require('../models/Ride')
+const User         = require('../models/User')
+const Notification = require('../models/Notification')
 
 // 💳 Stripe — chaves selecionadas automaticamente (test/live) por NODE_ENV
 const { stripe, publishableKey, mode } = require('../config/stripe')
@@ -245,6 +247,130 @@ router.get('/config', (req, res) => {
     publishableKey,
     mode, // 'test' ou 'live' — útil para UI indicar modo de teste
   })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST /api/payments/confirm-ride
+//
+// Chamado pelo FRONTEND imediatamente após stripe.confirmPayment() retornar
+// com status 'succeeded'. Garante o registro da reserva no banco mesmo que o
+// webhook do Stripe demore ou falhe.
+//
+// Body: { paymentIntentId: String, rideId: String }
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post('/confirm-ride', paymentLimiter, auth, async (req, res) => {
+  const { paymentIntentId, rideId } = req.body
+
+  if (!paymentIntentId || !rideId) {
+    return res.status(400).json({ error: 'paymentIntentId e rideId são obrigatórios' })
+  }
+
+  try {
+    // 1. Verificar o PaymentIntent diretamente no Stripe
+    const pi = await stripe.paymentIntents.retrieve(paymentIntentId)
+
+    if (pi.status !== 'succeeded' && pi.status !== 'requires_capture') {
+      return res.status(400).json({
+        error: `Pagamento ainda não confirmado. Status: ${pi.status}`,
+      })
+    }
+
+    // 2. Validar que o PI pertence a este usuário e a esta viagem
+    const metaUserId = pi.metadata?.userId
+    const metaRideId = pi.metadata?.rideId
+
+    if (metaUserId !== String(req.user.id)) {
+      return res.status(403).json({ error: 'PaymentIntent não pertence a este usuário' })
+    }
+    if (metaRideId !== String(rideId)) {
+      return res.status(400).json({ error: 'PaymentIntent não corresponde a esta viagem' })
+    }
+
+    // 3. Buscar viagem
+    const ride = await Ride.findById(rideId)
+    if (!ride) return res.status(404).json({ error: 'Viagem não encontrada' })
+
+    // 4. Idempotência — passageiro já foi adicionado? (webhook pode ter chegado primeiro)
+    const existing = ride.passengers.find(
+      p => String(p.user) === String(req.user.id) && p.status !== 'cancelled'
+    )
+
+    if (existing) {
+      // Já registrado — retornar o código existente
+      return res.json({
+        message: 'Reserva já confirmada',
+        validationCode: existing.validationCode || `TM-${existing._id.toString().slice(-4).toUpperCase()}`,
+        alreadyConfirmed: true,
+      })
+    }
+
+    // 5. Gerar código de validação único (TM-XXXX)
+    const genCode = () => {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+      let code = 'TM-'
+      for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)]
+      return code
+    }
+
+    let validationCode = genCode()
+    // Garantir unicidade dentro da viagem (improvável mas seguro)
+    while (ride.passengers.some(p => p.validationCode === validationCode)) {
+      validationCode = genCode()
+    }
+
+    // 6. Adicionar passageiro com status 'paid' e código gerado
+    const user = await User.findById(req.user.id).select('name handle')
+
+    ride.passengers.push({
+      user: req.user.id,
+      name: user?.name || pi.metadata.userName || 'Passageiro',
+      handle: user?.handle || '',
+      status: 'paid',
+      paidAmount: pi.amount,
+      isMember: pi.metadata.isMember === 'true',
+      validationCode,
+      paymentIntentId,
+    })
+
+    // 7. Atualizar escrow e status
+    ride.escrowTotal += pi.amount
+    const activeCount = ride.passengers.filter(p => p.status !== 'cancelled').length
+    if (activeCount >= ride.totalSeats) ride.status = 'full'
+
+    await ride.save()
+
+    // 8. Notificações
+    await Promise.allSettled([
+      Notification.create({
+        user: req.user.id,
+        type: 'ride_payment_confirmed',
+        title: 'Reserva confirmada!',
+        message: `Sua reserva na viagem ${ride.shareCode} está confirmada. Código: ${validationCode}`,
+      }),
+      Notification.create({
+        user: ride.driver,
+        type: 'ride_new_passenger',
+        title: 'Nova reserva!',
+        message: `${user?.name || 'Passageiro'} reservou uma vaga na viagem ${ride.shareCode}.`,
+        fromUser: req.user.id,
+        fromName: user?.name,
+      }),
+    ])
+
+    console.log(`[CONFIRM-RIDE] Viagem ${rideId}: passageiro ${req.user.id} confirmado | código ${validationCode}`)
+
+    res.json({
+      message: 'Reserva confirmada com sucesso!',
+      validationCode,
+      rideShareCode: ride.shareCode,
+    })
+  } catch (err) {
+    if (err.type?.startsWith('Stripe')) {
+      return res.status(502).json({ error: 'Erro ao verificar pagamento com Stripe' })
+    }
+    console.error('[CONFIRM-RIDE] Erro:', err.message)
+    res.status(500).json({ error: 'Erro ao confirmar reserva' })
+  }
 })
 
 module.exports = router

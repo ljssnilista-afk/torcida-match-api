@@ -11,10 +11,13 @@ const PassengerSchema = new mongoose.Schema({
   reservedAt:       { type: Date, default: Date.now },
 
   // ─── Volta condicional ───────────────────────────────────────────────────────
-  // null = motorista ainda não avaliou | true = aprovado para volta | false = reprovado
-  returnApproved:   { type: Boolean, default: null },
-  returnNote:       { type: String, default: '' },         // comentário opcional do motorista
-  returnEvaluatedAt:{ type: Date, default: null },
+  returnApproved:    { type: Boolean, default: null },
+  returnNote:        { type: String, default: '' },
+  returnEvaluatedAt: { type: Date, default: null },
+
+  // ─── Código de validação (gerado pelo backend, mostrado no embarque) ──────────
+  validationCode:    { type: String, default: '' },
+  paymentIntentId:   { type: String, default: '' },
 })
 
 const RideSchema = new mongoose.Schema({
