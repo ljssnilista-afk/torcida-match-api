@@ -44,7 +44,7 @@ async function requireMember(req, res, next) {
 // ─── POST /api/grupos — criar grupo ──────────────────────────────────────────
 router.post('/', auth, async (req, res) => {
   try {
-    const { name, team, bairro, zona, description, meetPoint, privacy, approvalRequired, groupType } = req.body
+    const { name, team, bairro, zona, description, meetPoint, privacy, approvalRequired, groupType, membershipFee } = req.body
     const userId = req.user.id
 
     const existing = await Group.findOne({ leader: userId })
@@ -69,6 +69,8 @@ router.post('/', auth, async (req, res) => {
       privacy: privacy || 'public',
       approvalRequired: !!approvalRequired,
       groupType: ['misto','organizada','familia','feminino','jovem'].includes(groupType) ? groupType : 'misto',
+      // Mensalidade em centavos (mínimo 100 = R$ 1,00, ou 0 = gratuito)
+      membershipFee: (typeof membershipFee === 'number' && membershipFee >= 100) ? Math.round(membershipFee) : 0,
       leader: userId,
       members: [userId],
     })
@@ -193,63 +195,60 @@ router.post('/:id/entrar', validId, auth, async (req, res) => {
 
     if (group.members.length >= group.maxMembers) return res.status(400).json({ error: 'Grupo cheio' })
 
-    // ── GRUPO PÚBLICO: líder precisa aprovar ──
+    // ── PÚBLICO: líder aprova manualmente ──
     if (group.privacy === 'public') {
       group.pendingMembers.push({
-        user: req.user.id,
-        name: req.user.name,
+        user:   req.user.id,
+        name:   req.user.name,
         handle: req.user.handle || '',
         status: 'pendingApproval',
       })
       await group.save()
 
-      // Notificar o líder
       await Notification.create({
-        user: group.leader,
-        type: 'group_join_request',
-        title: 'Nova solicitação de entrada',
-        message: `${req.user.name} quer entrar no grupo ${group.name}`,
-        group: group._id,
+        user:     group.leader,
+        type:     'group_join_request',
+        title:    'Nova solicitação de entrada',
+        message:  `${req.user.name} quer entrar no grupo ${group.name}`,
+        group:    group._id,
         fromUser: req.user.id,
         fromName: req.user.name,
       })
 
-      return res.json({ message: 'Solicitação enviada! O líder precisa aprovar sua entrada.', status: 'pendingApproval' })
-    }
-
-    // ── GRUPO PRIVADO: entrada direta, mas precisa pagar ──
-    if (group.membershipFee > 0) {
-      group.pendingMembers.push({
-        user: req.user.id,
-        name: req.user.name,
-        handle: req.user.handle || '',
-        status: 'pendingPayment',
-      })
-      await group.save()
       return res.json({
-        message: `Entrada confirmada! Pague a mensalidade de R$ ${(group.membershipFee / 100).toFixed(2).replace('.', ',')} para acessar o grupo.`,
-        status: 'pendingPayment',
-        fee: group.membershipFee,
+        message: 'Solicitação enviada! Aguardando aprovação do líder.',
+        status: 'pendingApproval',
       })
     }
 
-    // ── GRUPO PRIVADO GRATUITO: entrada direta ──
-    group.members.push(req.user.id)
-    await group.save()
+    // ── PRIVADO ──
+    if (group.privacy === 'private') {
+      // Se tem mensalidade >= R$ 1,00: pendingPayment
+      if (group.membershipFee >= 100) {
+        group.pendingMembers.push({
+          user:   req.user.id,
+          name:   req.user.name,
+          handle: req.user.handle || '',
+          status: 'pendingPayment',
+        })
+        await group.save()
 
-    await Message.create({
-      grupo: group._id, sender: req.user.id, senderName: req.user.name,
-      text: `${req.user.name} entrou no grupo`, type: 'system',
-    })
+        return res.json({
+          message: `Pague a mensalidade de R$ ${(group.membershipFee / 100).toFixed(2).replace('.', ',')} para entrar no grupo.`,
+          status:  'pendingPayment',
+          fee:     group.membershipFee,
+        })
+      }
 
-    if (req.app.locals.wsBroadcast) {
-      req.app.locals.wsBroadcast(group._id.toString(), {
-        type: 'member_joined',
-        data: { _id: req.user.id, name: req.user.name, handle: req.user.handle },
+      // Privado sem mensalidade: entrada direta
+      group.members.push(req.user.id)
+      await group.save()
+
+      return res.json({
+        message: 'Você entrou no grupo!',
+        status: 'joined',
       })
     }
-
-    res.json({ message: 'Entrou no grupo!', status: 'active', group })
   } catch (err) {
     console.error('[POST /grupos/:id/entrar]', err.message)
     res.status(500).json({ error: 'Erro ao entrar no grupo' })
