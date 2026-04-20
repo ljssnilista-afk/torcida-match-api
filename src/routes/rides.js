@@ -4,8 +4,11 @@ const router   = express.Router()
 const Ride     = require('../models/Ride')
 const Group    = require('../models/Group')
 const RideMessage = require('../models/RideMessage')
-const User     = require('../models/User')
+const User        = require('../models/User')
+const Transaction = require('../models/Transaction')
+const Notification = require('../models/Notification')
 const auth     = require('../middleware/auth')
+const { stripe } = require('../config/stripe')
 
 // Helper: sanitizar texto
 function sanitize(str) {
@@ -644,6 +647,131 @@ router.post('/:id/messages', validId, auth, async (req, res) => {
   } catch (err) {
     console.error('[POST /rides/:id/messages]', err.message)
     res.status(500).json({ error: 'Erro ao enviar mensagem' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST /api/rides/:id/validate-code
+//
+// Motorista digita o código TM-XXXX do passageiro no embarque.
+// → Stripe captura o pagamento (era só autorização)
+// → Passageiro passa para status 'confirmed'
+// → Motorista recebe 80% na carteira interna
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post('/:id/validate-code', auth, validId, async (req, res) => {
+  const { code } = req.body
+
+  if (!code || typeof code !== 'string') {
+    return res.status(400).json({ error: 'Código obrigatório' })
+  }
+
+  const normalizedCode = code.trim().toUpperCase()
+
+  try {
+    const ride = await Ride.findById(req.params.id)
+    if (!ride) return res.status(404).json({ error: 'Viagem não encontrada' })
+
+    // Apenas o motorista pode validar
+    if (String(ride.driver) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'Apenas o motorista pode validar códigos' })
+    }
+
+    // Encontrar passageiro com esse código e status 'authorized'
+    const passenger = ride.passengers.find(
+      p => p.validationCode === normalizedCode && p.status === 'authorized'
+    )
+
+    if (!passenger) {
+      // Verificar se foi já validado (idempotência amigável)
+      const alreadyDone = ride.passengers.find(
+        p => p.validationCode === normalizedCode && p.status === 'confirmed'
+      )
+      if (alreadyDone) {
+        return res.json({
+          message: `${alreadyDone.name} já foi validado anteriormente.`,
+          passengerName: alreadyDone.name,
+          alreadyConfirmed: true,
+        })
+      }
+      return res.status(404).json({ error: 'Código inválido. Verifique e tente novamente.' })
+    }
+
+    if (!passenger.paymentIntentId) {
+      return res.status(400).json({ error: 'PaymentIntent não encontrado para este passageiro' })
+    }
+
+    // ── Capturar pagamento no Stripe ─────────────────────────────────────────
+    const captured = await stripe.paymentIntents.capture(passenger.paymentIntentId)
+
+    // ── Atualizar status do passageiro ────────────────────────────────────────
+    passenger.status    = 'confirmed'
+    passenger.capturedAt = new Date()
+    await ride.save()
+
+    // ── Creditar motorista (80%) ──────────────────────────────────────────────
+    const capturedAmount = captured.amount_received
+    const appCommission  = Math.round(capturedAmount * 0.20)
+    const driverCredit   = capturedAmount - appCommission
+
+    await User.findByIdAndUpdate(ride.driver, {
+      $inc: { walletBalance: driverCredit },
+    })
+
+    // Transação do motorista (crédito)
+    await Transaction.create({
+      userId:                ride.driver,
+      type:                  'deposit',
+      amount:                driverCredit,
+      status:                'completed',
+      description:           `Embarque confirmado de ${passenger.name} — viagem ${ride.shareCode}`,
+      relatedId:             ride._id,
+      relatedType:           'ride',
+      stripePaymentIntentId: passenger.paymentIntentId,
+      appCommission,
+    }).catch(e => console.error('[VALIDATE-CODE] Falha Transaction motorista:', e.message))
+
+    // Atualizar transação do passageiro de 'pending' para 'completed'
+    await Transaction.findOneAndUpdate(
+      { stripePaymentIntentId: passenger.paymentIntentId, type: 'payment' },
+      { status: 'completed' }
+    ).catch(() => {})
+
+    // ── Notificações ──────────────────────────────────────────────────────────
+    await Promise.allSettled([
+      Notification.create({
+        user:    passenger.user,
+        type:    'ride_code_validated',
+        title:   'Embarque confirmado!',
+        message: `O motorista confirmou sua chegada na viagem ${ride.shareCode}. Boa viagem! 🚗`,
+      }),
+      Notification.create({
+        user:      ride.driver,
+        type:      'ride_payment_captured',
+        title:     'Pagamento recebido!',
+        message:   `R$ ${(driverCredit / 100).toFixed(2).replace('.', ',')} creditado na sua carteira — embarque de ${passenger.name} confirmado.`,
+        fromUser:  passenger.user,
+        fromName:  passenger.name,
+      }),
+    ])
+
+    console.log(`[VALIDATE-CODE] Viagem ${ride._id}: código ${normalizedCode} validado | passageiro=${passenger.name} | motorista creditado R$ ${(driverCredit / 100).toFixed(2)}`)
+
+    res.json({
+      message: `✅ ${passenger.name} confirmado! R$ ${(driverCredit / 100).toFixed(2).replace('.', ',')} adicionado à sua carteira.`,
+      passengerName: passenger.name,
+      credited: driverCredit,
+      creditedFormatted: `R$ ${(driverCredit / 100).toFixed(2).replace('.', ',')}`,
+    })
+  } catch (err) {
+    if (err.type === 'StripeInvalidRequestError' && err.code === 'payment_intent_unexpected_state') {
+      return res.status(400).json({ error: 'Pagamento não está em estado capturável. Verifique com o passageiro.' })
+    }
+    if (err.type?.startsWith('Stripe')) {
+      console.error('[VALIDATE-CODE] Erro Stripe:', err.message)
+      return res.status(502).json({ error: 'Erro ao processar pagamento. Tente novamente.' })
+    }
+    console.error('[VALIDATE-CODE]', err.message)
+    res.status(500).json({ error: 'Erro ao validar código' })
   }
 })
 

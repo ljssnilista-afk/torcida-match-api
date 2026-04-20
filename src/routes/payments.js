@@ -5,7 +5,8 @@ const auth         = require('../middleware/auth')
 const Group        = require('../models/Group')
 const Ride         = require('../models/Ride')
 const User         = require('../models/User')
-const Notification = require('../models/Notification')
+const Notification  = require('../models/Notification')
+const Transaction   = require('../models/Transaction')
 
 // 💳 Stripe — chaves selecionadas automaticamente (test/live) por NODE_ENV
 const { stripe, publishableKey, mode } = require('../config/stripe')
@@ -199,6 +200,9 @@ router.post(
       const paymentIntent = await stripe.paymentIntents.create({
         amount: finalPrice,
         currency: 'brl',
+        // ⚠️ ESCROW: autorizar agora, capturar SOMENTE quando o motorista
+        // validar o código TM-XXXX do passageiro no embarque.
+        capture_method: 'manual',
         metadata: {
           type: 'ride_reservation',
           rideId: String(ride._id),
@@ -318,46 +322,60 @@ router.post('/confirm-ride', paymentLimiter, auth, async (req, res) => {
       validationCode = genCode()
     }
 
-    // 6. Adicionar passageiro com status 'paid' e código gerado
+    // 6. Adicionar passageiro com status 'authorized' (pagamento autorizado, não capturado)
+    // O crédito do motorista SÓ acontece após validação do código TM-XXXX no embarque.
     const user = await User.findById(req.user.id).select('name handle')
 
     ride.passengers.push({
       user: req.user.id,
       name: user?.name || pi.metadata.userName || 'Passageiro',
       handle: user?.handle || '',
-      status: 'paid',
+      status: 'authorized',          // ← escrow: autorizado, aguarda validação
       paidAmount: pi.amount,
       isMember: pi.metadata.isMember === 'true',
       validationCode,
       paymentIntentId,
     })
 
-    // 7. Atualizar escrow e status
+    // 7. Atualizar escrow e status da viagem
     ride.escrowTotal += pi.amount
     const activeCount = ride.passengers.filter(p => p.status !== 'cancelled').length
     if (activeCount >= ride.totalSeats) ride.status = 'full'
 
     await ride.save()
 
-    // 8. Notificações
+    // 8. Transação do passageiro (authorization — pending capture)
+    await Transaction.create({
+      userId:                req.user.id,
+      type:                  'payment',
+      amount:                pi.amount,
+      status:                'pending',     // ← pending até o motorista capturar
+      description:           `Autorização reserva viagem ${ride.shareCode} — ${ride.game?.homeTeam} × ${ride.game?.awayTeam}`,
+      relatedId:             ride._id,
+      relatedType:           'ride',
+      stripePaymentIntentId: paymentIntentId,
+      appCommission:         Math.round(pi.amount * 0.20),
+    }).catch(e => console.error('[CONFIRM-RIDE] Falha ao registrar Transaction passageiro:', e.message))
+
+    console.log(`[CONFIRM-RIDE] Viagem ${rideId}: passageiro ${req.user.id} autorizado | código ${validationCode} | aguarda validação no embarque`)
+
+    // 9. Notificações
     await Promise.allSettled([
       Notification.create({
         user: req.user.id,
         type: 'ride_payment_confirmed',
-        title: 'Reserva confirmada!',
-        message: `Sua reserva na viagem ${ride.shareCode} está confirmada. Código: ${validationCode}`,
+        title: 'Vaga garantida!',
+        message: `Sua vaga na viagem ${ride.shareCode} está reservada. Mostre o código ${validationCode} ao motorista no embarque.`,
       }),
       Notification.create({
         user: ride.driver,
         type: 'ride_new_passenger',
         title: 'Nova reserva!',
-        message: `${user?.name || 'Passageiro'} reservou uma vaga na viagem ${ride.shareCode}.`,
+        message: `${user?.name || 'Passageiro'} reservou uma vaga na viagem ${ride.shareCode}. Valide o código no embarque para confirmar o pagamento.`,
         fromUser: req.user.id,
         fromName: user?.name,
       }),
     ])
-
-    console.log(`[CONFIRM-RIDE] Viagem ${rideId}: passageiro ${req.user.id} confirmado | código ${validationCode}`)
 
     res.json({
       message: 'Reserva confirmada com sucesso!',

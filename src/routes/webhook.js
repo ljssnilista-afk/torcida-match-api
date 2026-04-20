@@ -74,7 +74,15 @@ async function processEvent(event) {
 
   switch (type) {
     case 'payment_intent.succeeded':
+      // Para viagens: succeeded dispara APÓS stripe.paymentIntents.capture() no validate-code.
+      // O crédito do motorista já foi feito lá — webhook só processa group_membership aqui.
       await handlePaymentSucceeded(paymentIntent)
+      break
+
+    case 'payment_intent.amount_capturable_updated':
+      // Disparado quando o passageiro autorizou (requires_capture).
+      // confirm-ride já registrou o passageiro — só logamos aqui.
+      console.log(`[WEBHOOK] PI autorizado (aguarda validação): ${paymentIntent.id}`)
       break
 
     case 'payment_intent.payment_failed':
@@ -229,103 +237,61 @@ async function handleGroupPaymentSuccess(paymentIntent) {
   }
 }
 
-// ─── Pagamento de viagem aprovado ────────────────────────────────────────────
+// ─── Pagamento de viagem capturado (succeeded após validate-code) ────────────
 async function handleRidePaymentSuccess(paymentIntent) {
-  const { rideId, userId, userName, isMember } = paymentIntent.metadata
-  const amount = paymentIntent.amount
+  const { rideId, userId, userName } = paymentIntent.metadata
 
   try {
-    const ride = await Ride.findById(rideId)
-    if (!ride) {
-      console.error(`[WEBHOOK] Viagem não encontrada: ${rideId}`)
-      return
-    }
-
-    // Verificar se o passageiro já foi adicionado (idempotência interna)
-    const alreadyIn = ride.passengers.find(
-      p => String(p.user) === userId && p.status !== 'cancelled'
-    )
-    if (alreadyIn) {
-      console.log(`[WEBHOOK] Passageiro ${userId} já está na viagem ${rideId}`)
-      return
-    }
-
-    // Buscar nome/handle do usuário
-    const user = await User.findById(userId).select('name handle')
-
-    // Adicionar passageiro com status 'paid'
-    ride.passengers.push({
-      user: userId,
-      name: user?.name || userName || 'Passageiro',
-      handle: user?.handle || '',
-      status: 'paid',
-      paidAmount: amount,
-      isMember: isMember === 'true',
-    })
-
-    // Escrow: acumular pagamento
-    ride.escrowTotal += amount
-
-    // Atualizar status se lotou
-    const activeCount = ride.passengers.filter(p => p.status !== 'cancelled').length
-    if (activeCount >= ride.totalSeats) {
-      ride.status = 'full'
-    }
-
-    await ride.save()
-
-    // ─── Registrar transação do passageiro ──────────────────────────────────
-    const appCommission = Math.round(amount * 0.20)
-    const driverCredit  = amount - appCommission  // 80% para o motorista
-
-    await Transaction.create({
-      userId,
-      type: 'payment',
-      amount,
-      status: 'completed',
-      description: `Reserva viagem ${ride.shareCode} — ${ride.game.homeTeam} × ${ride.game.awayTeam}`,
-      relatedId: ride._id,
-      relatedType: 'ride',
+    // Com capture_method:'manual', payment_intent.succeeded só dispara
+    // DEPOIS de stripe.paymentIntents.capture() no endpoint validate-code.
+    // O crédito do motorista já foi feito lá — aqui só verificamos se
+    // o passageiro já está confirmado e registramos backup se necessário.
+    const alreadyCredited = await Transaction.findOne({
       stripePaymentIntentId: paymentIntent.id,
-      appCommission,
-    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (passageiro):', e.message))
-
-    // ─── Carteira do motorista: creditar 80% do valor da vaga ───────────────
-    await User.findByIdAndUpdate(ride.driver, {
-      $inc: { walletBalance: driverCredit },
+      type:   'deposit',
     })
+
+    if (alreadyCredited) {
+      // validate-code já processou tudo — nada a fazer
+      console.log(`[WEBHOOK] Ride ${rideId}: succeeded recebido, crédito já processado via validate-code`)
+      return
+    }
+
+    // Edge case: validate-code falhou mas Stripe capturou (retry / fallback)
+    const ride = await Ride.findById(rideId)
+    if (!ride) { console.error(`[WEBHOOK] Viagem não encontrada: ${rideId}`); return }
+
+    const amount = paymentIntent.amount_received || paymentIntent.amount
+    const appCommission = Math.round(amount * 0.20)
+    const driverCredit  = amount - appCommission
+
+    await User.findByIdAndUpdate(ride.driver, { $inc: { walletBalance: driverCredit } })
 
     await Transaction.create({
       userId:      ride.driver,
       type:        'deposit',
       amount:      driverCredit,
       status:      'completed',
-      description: `Vaga reservada por ${userName} — viagem ${ride.shareCode}`,
+      description: `[Fallback webhook] Embarque ${userName} — viagem ${ride.shareCode}`,
       relatedId:   ride._id,
       relatedType: 'ride',
       stripePaymentIntentId: paymentIntent.id,
       appCommission,
-    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (motorista):', e.message))
+    }).catch(e => console.error('[WEBHOOK] Falha Transaction motorista fallback:', e.message))
 
-    // Notificação para o passageiro
-    await Notification.create({
-      user: userId,
-      type: 'ride_payment_confirmed',
-      title: 'Reserva confirmada!',
-      message: `Sua reserva na viagem ${ride.shareCode} foi confirmada. R$ ${(amount / 100).toFixed(2)}`,
-    })
+    // Atualizar passageiro para confirmed se ainda estiver authorized
+    const passenger = ride.passengers.find(
+      p => String(p.user) === userId && p.status === 'authorized'
+    )
+    if (passenger) {
+      passenger.status = 'confirmed'
+      passenger.capturedAt = new Date()
+      await ride.save()
+    }
 
-    // Notificação para o motorista
-    await Notification.create({
-      user: ride.driver,
-      type: 'ride_new_passenger',
-      title: 'Novo passageiro!',
-      message: `${userName} reservou uma vaga na viagem ${ride.shareCode}.`,
-      fromUser: userId,
-      fromName: userName,
-    })
+    console.log(`[WEBHOOK] Viagem ${rideId}: fallback — motorista creditado R$ ${(driverCredit / 100).toFixed(2)}`)
 
-    console.log(`[WEBHOOK] Viagem ${rideId}: passageiro ${userId} adicionado | motorista creditado R$ ${(driverCredit / 100).toFixed(2)}`)
+    console.log(`[WEBHOOK] Viagem ${rideId}: passageiro ${userId} processado com sucesso`)
   } catch (err) {
     console.error(`[WEBHOOK] Erro ao processar pagamento de viagem: ${err.message}`)
     throw err

@@ -4,7 +4,12 @@ const PassengerSchema = new mongoose.Schema({
   user:             { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   name:             { type: String, required: true },
   handle:           { type: String, default: '' },
-  status:           { type: String, enum: ['reserved', 'paid', 'confirmed', 'cancelled'], default: 'reserved' },
+  // authorized  = pagamento autorizado (requires_capture) — aguarda validação do código no embarque
+  // confirmed   = código validado pelo motorista, pagamento capturado
+  // paid        = legado / pagamentos de grupo
+  // cancelled   = cancelado
+  status:           { type: String, enum: ['reserved', 'authorized', 'paid', 'confirmed', 'cancelled'], default: 'reserved' },
+  capturedAt:       { type: Date, default: null },   // quando o motorista validou o código
   paidAmount:       { type: Number, default: 0 },         // quanto pagou (simulado)
   isMember:         { type: Boolean, default: false },     // era membro do grupo do motorista?
   confirmedAt:      { type: Date, default: null },         // quando o passageiro confirmou a viagem
