@@ -42,6 +42,17 @@ const userSchema = new mongoose.Schema(
     rideHistory:        [RideHistorySchema],
 
     memberSince: { type: Date, default: Date.now },
+
+    // ─── Stripe Connect (motoristas e líderes) ─────────────────────────────────
+    stripeAccountId:      { type: String, default: null },   // ID da conta Express no Stripe
+    stripeOnboardingDone: { type: Boolean, default: false }, // onboarding concluído?
+
+    // ─── Carteira digital (apenas líderes) ────────────────────────────────────
+    walletBalance: { type: Number, default: 0 }, // saldo em centavos
+
+    // ─── Chave PIX (solicitada no saque, armazenada criptografada) ────────────
+    pixKey:     { type: String, default: null },
+    pixKeyType: { type: String, enum: ['cpf', 'email', 'phone', 'random', null], default: null },
   },
   { timestamps: true }
 )

@@ -5,6 +5,7 @@ const User         = require('../models/User')
 const Message      = require('../models/Message')
 const Notification = require('../models/Notification')
 const StripeEvent  = require('../models/StripeEvent')
+const Transaction  = require('../models/Transaction')
 
 // 💳 Stripe — chaves selecionadas automaticamente (test/live) por NODE_ENV
 const { stripe, webhookSecret } = require('../config/stripe')
@@ -82,6 +83,15 @@ async function processEvent(event) {
 
     case 'charge.refunded':
       await handleChargeRefunded(data.object)
+      break
+
+    // ─── Eventos Stripe Connect ────────────────────────────────────────────────
+    case 'account.updated':
+      await handleAccountUpdated(data.object)
+      break
+
+    case 'transfer.created':
+      console.log(`[WEBHOOK] Transfer criado: ${data.object.id} → ${data.object.destination}`)
       break
 
     default:
@@ -177,7 +187,42 @@ async function handleGroupPaymentSuccess(paymentIntent) {
       fromName: userName,
     })
 
-    console.log(`[WEBHOOK] Grupo ${groupId}: membro ${userId} ativado com sucesso`)
+    // ─── Carteira do líder: creditar 80% da mensalidade ─────────────────────
+    const totalAmount    = paymentIntent.amount           // centavos
+    const appCommission  = Math.round(totalAmount * 0.20) // 20% plataforma
+    const leaderCredit   = totalAmount - appCommission    // 80% para o líder
+
+    await User.findByIdAndUpdate(group.leader, {
+      $inc: { walletBalance: leaderCredit },
+    })
+
+    // Transação do líder (crédito na carteira)
+    await Transaction.create({
+      userId:      group.leader,
+      type:        'deposit',
+      amount:      leaderCredit,
+      status:      'completed',
+      description: `Mensalidade de ${userName} — grupo ${group.name}`,
+      relatedId:   group._id,
+      relatedType: 'group',
+      stripePaymentIntentId: paymentIntent.id,
+      appCommission,
+    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (líder):', e.message))
+
+    // Transação do membro (pagamento)
+    await Transaction.create({
+      userId:      userId,
+      type:        'payment',
+      amount:      totalAmount,
+      status:      'completed',
+      description: `Mensalidade — grupo ${group.name}`,
+      relatedId:   group._id,
+      relatedType: 'group',
+      stripePaymentIntentId: paymentIntent.id,
+      appCommission,
+    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (membro):', e.message))
+
+    console.log(`[WEBHOOK] Grupo ${groupId}: membro ${userId} ativado | líder creditado R$ ${(leaderCredit / 100).toFixed(2)}`)
   } catch (err) {
     console.error(`[WEBHOOK] Erro ao processar pagamento de grupo: ${err.message}`)
     throw err // re-throw para log no processEvent
@@ -229,6 +274,39 @@ async function handleRidePaymentSuccess(paymentIntent) {
 
     await ride.save()
 
+    // ─── Registrar transação do passageiro ──────────────────────────────────
+    const appCommission = Math.round(amount * 0.20)
+    const driverCredit  = amount - appCommission  // 80% para o motorista
+
+    await Transaction.create({
+      userId,
+      type: 'payment',
+      amount,
+      status: 'completed',
+      description: `Reserva viagem ${ride.shareCode} — ${ride.game.homeTeam} × ${ride.game.awayTeam}`,
+      relatedId: ride._id,
+      relatedType: 'ride',
+      stripePaymentIntentId: paymentIntent.id,
+      appCommission,
+    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (passageiro):', e.message))
+
+    // ─── Carteira do motorista: creditar 80% do valor da vaga ───────────────
+    await User.findByIdAndUpdate(ride.driver, {
+      $inc: { walletBalance: driverCredit },
+    })
+
+    await Transaction.create({
+      userId:      ride.driver,
+      type:        'deposit',
+      amount:      driverCredit,
+      status:      'completed',
+      description: `Vaga reservada por ${userName} — viagem ${ride.shareCode}`,
+      relatedId:   ride._id,
+      relatedType: 'ride',
+      stripePaymentIntentId: paymentIntent.id,
+      appCommission,
+    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (motorista):', e.message))
+
     // Notificação para o passageiro
     await Notification.create({
       user: userId,
@@ -247,10 +325,25 @@ async function handleRidePaymentSuccess(paymentIntent) {
       fromName: userName,
     })
 
-    console.log(`[WEBHOOK] Viagem ${rideId}: passageiro ${userId} adicionado com sucesso`)
+    console.log(`[WEBHOOK] Viagem ${rideId}: passageiro ${userId} adicionado | motorista creditado R$ ${(driverCredit / 100).toFixed(2)}`)
   } catch (err) {
     console.error(`[WEBHOOK] Erro ao processar pagamento de viagem: ${err.message}`)
     throw err
+  }
+}
+
+// ─── Conta Connect atualizada ─────────────────────────────────────────────────
+async function handleAccountUpdated(account) {
+  try {
+    const userId = account.metadata?.userId
+    if (!userId) return
+
+    const onboardingDone = account.details_submitted && account.charges_enabled
+
+    await User.findByIdAndUpdate(userId, { stripeOnboardingDone: onboardingDone })
+    console.log(`[WEBHOOK] Conta Connect ${account.id}: onboarding=${onboardingDone} | user=${userId}`)
+  } catch (err) {
+    console.error(`[WEBHOOK] Erro ao atualizar conta Connect: ${err.message}`)
   }
 }
 
