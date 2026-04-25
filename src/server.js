@@ -4,25 +4,25 @@ const mongoose   = require('mongoose')
 const cors       = require('cors')
 const http       = require('http')
 const { WebSocketServer } = require('ws')
-const jwt        = require('jsonwebtoken')        // 🔒 NOVO — para validar JWT no WebSocket
-const helmet     = require('helmet')               // 🔒 NOVO — headers de segurança
-const rateLimit  = require('express-rate-limit')   // 🔒 NOVO — proteção contra brute force
+const jwt        = require('jsonwebtoken')
+const helmet     = require('helmet')
+const rateLimit  = require('express-rate-limit')
 
 const authRoutes    = require('./routes/auth')
 const profileRoutes = require('./routes/profile')
 const bsdProxy      = require('./routes/bsdProxy')
 const gruposRoutes  = require('./routes/grupos')
 const newsRoutes    = require('./routes/news')
-const ridesRoutes   = require('./routes/rides')         // 🚌 NOVO — marketplace de viagens
-const invitesRoutes = require('./routes/invites')       // 📩 NOVO — convites
-const notificationsRoutes = require('./routes/notifications') // 🔔 NOVO — notificações
-const footballDataRoutes  = require('./routes/footballData')   // ⚽ NOVO — football-data.org v4
-const paymentsRoutes = require('./routes/payments')     // 💳 NOVO — Stripe PaymentIntents
-const webhookRoutes  = require('./routes/webhook')      // 💳 NOVO — Stripe Webhooks
-const connectRoutes  = require('./routes/connect')      // 🔗 NOVO — Stripe Connect onboarding
-const walletRoutes   = require('./routes/wallet')       // 💰 NOVO — Carteira digital e saques
-const Group         = require('./models/Group')      // 🔒 NOVO — para verificar membro no WebSocket
-const Ride          = require('./models/Ride')       // 💬 NOVO — para verificar participante no chat de viagem
+const ridesRoutes   = require('./routes/rides')
+const invitesRoutes = require('./routes/invites')
+const notificationsRoutes = require('./routes/notifications')
+const footballDataRoutes  = require('./routes/footballData')
+const paymentsRoutes = require('./routes/payments')
+const webhookRoutes  = require('./routes/webhook')
+const connectRoutes  = require('./routes/connect')
+const walletRoutes   = require('./routes/wallet')
+const Group         = require('./models/Group')
+const Ride          = require('./models/Ride')
 
 const app    = express()
 const server = http.createServer(app)
@@ -49,7 +49,6 @@ server.on('upgrade', (req, socket, head) => {
 })
 
 wss.on('connection', async (ws, req) => {
-  // 🔒 Validar JWT na conexão WebSocket
   let userId
   try {
     const url = new URL(req.url, `http://${req.headers.host}`)
@@ -70,8 +69,6 @@ wss.on('connection', async (ws, req) => {
 
   const grupoId = req.url.split('/ws/grupos/')[1]?.split('?')[0]
   if (!grupoId) return ws.close()
-
-  // 🔒 NOVO — Verificar se o usuário é membro do grupo
   try {
     const group = await Group.findById(grupoId)
     if (!group) {
@@ -108,7 +105,6 @@ app.locals.wsBroadcast = (grupoId, payload) => {
 
 // ─── WebSocket Rides — conexão ────────────────────────────────────────────────
 wssRides.on('connection', async (ws, req) => {
-  // 🔒 Validar JWT
   let userId
   try {
     const url = new URL(req.url, `http://${req.headers.host}`)
@@ -124,8 +120,6 @@ wssRides.on('connection', async (ws, req) => {
 
   const rideId = req.url.split('/ws/rides/')[1]?.split('?')[0]
   if (!rideId) return ws.close()
-
-  // 🔒 Verificar se é motorista ou passageiro confirmado/pago
   try {
     const ride = await Ride.findById(rideId)
     if (!ride) { ws.close(4002, 'Viagem não encontrada'); return }
@@ -162,7 +156,7 @@ app.locals.wsRideBroadcast = (rideId, payload) => {
 }
 
 // ─── Segurança ────────────────────────────────────────────────────────────────
-app.use(helmet()) // 🔒 NOVO — headers de segurança (X-Content-Type-Options, etc.)
+app.use(helmet())
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({
@@ -181,11 +175,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }))
-
-// 💳 WEBHOOK — deve vir ANTES do express.json() (precisa do body raw/Buffer)
 app.use('/api/webhook', express.raw({ type: 'application/json' }), webhookRoutes)
-
-// 🔒 MELHORADO — body parser com limite de tamanho
 app.use(express.json({ limit: '500kb' }))
 app.use(express.urlencoded({ extended: true, limit: '500kb' }))
 
@@ -193,7 +183,6 @@ app.use(express.urlencoded({ extended: true, limit: '500kb' }))
 app.set('trust proxy', 1)
 
 // ─── Rate Limiting ────────────────────────────────────────────────────────────
-// 🔒 NOVO — limite global: 100 requisições por minuto por IP
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
@@ -202,8 +191,6 @@ const globalLimiter = rateLimit({
   message: { error: 'Muitas requisições. Tente novamente em 1 minuto.' },
 })
 app.use('/api/', globalLimiter)
-
-// 🔒 NOVO — limite de auth: 10 tentativas por 15 minutos por IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -216,20 +203,20 @@ app.use('/api/auth/register', authLimiter)
 
 // ─── Rotas ────────────────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) =>
-  res.json({ status: 'OK', message: 'API funcionando!' })) // 🔒 Removido env da resposta
+  res.json({ status: 'OK', message: 'API funcionando!' }))
 
 app.use('/api/auth',    authRoutes)
 app.use('/api/profile', profileRoutes)
 app.use('/api/bsd',     bsdProxy)
 app.use('/api/grupos',  gruposRoutes)
 app.use('/api/news',    newsRoutes)
-app.use('/api/rides',   ridesRoutes)                    // 🚌 NOVO — marketplace de viagens
-app.use('/api/invites', invitesRoutes)                  // 📩 NOVO — convites
-app.use('/api/notifications', notificationsRoutes)     // 🔔 NOVO — notificações
-app.use('/api/football',      footballDataRoutes)       // ⚽ NOVO — football-data.org v4
-app.use('/api/payments',      paymentsRoutes)            // 💳 Stripe PaymentIntents
-app.use('/api/connect',       connectRoutes)            // 🔗 Stripe Connect onboarding
-app.use('/api/wallet',        walletRoutes)             // 💰 Carteira digital e saques
+app.use('/api/rides',   ridesRoutes)
+app.use('/api/invites', invitesRoutes)
+app.use('/api/notifications', notificationsRoutes)
+app.use('/api/football',      footballDataRoutes)
+app.use('/api/payments',      paymentsRoutes)
+app.use('/api/connect',       connectRoutes)
+app.use('/api/wallet',        walletRoutes)
 
 app.get('/health', (req, res) =>
   res.json({ status: 'ok', app: 'TorcidaMatch API', time: new Date().toISOString() }))
@@ -238,7 +225,6 @@ app.use((req, res) =>
   res.status(404).json({ error: `Rota ${req.method} ${req.path} não encontrada` }))
 
 // ─── Error Handler Global ────────────────────────────────────────────────────
-// 🔒 NOVO — captura erros sem vazar stack traces
 app.use((err, req, res, next) => {
   console.error(`[ERROR] ${req.method} ${req.path}:`, err.message)
   res.status(err.status || 500).json({
@@ -254,7 +240,7 @@ mongoose.connect(process.env.MONGODB_URI)
     console.log('✅ MongoDB conectado')
     server.listen(PORT, () => {
       console.log(`🚀 TorcidaMatch API rodando na porta ${PORT}`)
-      console.log(`🔌 WebSocket ativo (com autenticação JWT)`) // 🔒 Atualizado
+      console.log(`🔌 WebSocket ativo (com autenticação JWT)`)
     })
   })
   .catch(err => {
