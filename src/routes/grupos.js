@@ -4,7 +4,9 @@ const router   = express.Router()
 const Group    = require('../models/Group')
 const Message  = require('../models/Message')
 const Notification = require('../models/Notification')
+const User     = require('../models/User')
 const auth     = require('../middleware/auth')
+const { stripe } = require('../config/stripe')
 
 // 🔒 NOVO — helper de sanitização anti-XSS
 function sanitize(str) {
@@ -42,6 +44,12 @@ async function requireMember(req, res, next) {
 }
 
 // ─── POST /api/grupos — criar grupo ──────────────────────────────────────────
+//
+// 🔒 Se o grupo for PRIVADO PAGO (membershipFee >= 100), o líder precisa ter
+//    concluído o onboarding Stripe ANTES — caso contrário não há para onde
+//    repassar a mensalidade.
+//
+//    Grupos públicos / privados gratuitos: criação livre, sem onboarding.
 router.post('/', auth, async (req, res) => {
   try {
     const { name, team, bairro, zona, description, meetPoint, privacy, approvalRequired, groupType, membershipFee } = req.body
@@ -50,7 +58,7 @@ router.post('/', auth, async (req, res) => {
     const existing = await Group.findOne({ leader: userId })
     if (existing) return res.status(400).json({ error: 'Você já é líder de um grupo.' })
 
-    // 🔒 MELHORADO — sanitizar inputs de texto
+    // 🔒 sanitizar inputs de texto
     const cleanName = sanitize(name?.trim())
     const cleanBairro = sanitize(bairro?.trim())
     const cleanMeetPoint = sanitize(meetPoint?.trim())
@@ -62,6 +70,28 @@ router.post('/', auth, async (req, res) => {
     })
     if (duplicate) return res.status(400).json({ error: 'Já existe um grupo com esse nome para esse time e bairro.' })
 
+    const fee = (typeof membershipFee === 'number' && membershipFee >= 100) ? Math.round(membershipFee) : 0
+
+    // 🔒 BLOQUEIO ONBOARDING — grupo pago exige Connected Account ativa
+    if (fee > 0) {
+      const leader = await User.findById(userId).select(
+        'stripeAccountId stripeOnboardingDone chargesEnabled accountUnderReview suspendedUntil'
+      )
+      if (leader?.accountUnderReview) {
+        return res.status(403).json({ error: 'Conta sob revisão. Entre em contato com o suporte.', code: 'ACCOUNT_UNDER_REVIEW' })
+      }
+      if (leader?.suspendedUntil && leader.suspendedUntil > new Date()) {
+        return res.status(403).json({ error: 'Conta suspensa.', code: 'ACCOUNT_SUSPENDED', suspendedUntil: leader.suspendedUntil })
+      }
+      if (!leader?.stripeAccountId || !leader.stripeOnboardingDone || !leader.chargesEnabled) {
+        return res.status(403).json({
+          error: 'Para criar um grupo PAGO você precisa concluir o cadastro financeiro primeiro.',
+          code: 'ONBOARDING_REQUIRED',
+          action: 'POST /api/connect/onboard',
+        })
+      }
+    }
+
     const group = await Group.create({
       name: cleanName, team, bairro: cleanBairro, zona,
       description: sanitize(description?.trim() || ''),
@@ -69,11 +99,38 @@ router.post('/', auth, async (req, res) => {
       privacy: privacy || 'public',
       approvalRequired: !!approvalRequired,
       groupType: ['misto','organizada','familia','feminino','jovem'].includes(groupType) ? groupType : 'misto',
-      // Mensalidade em centavos (mínimo 100 = R$ 1,00, ou 0 = gratuito)
-      membershipFee: (typeof membershipFee === 'number' && membershipFee >= 100) ? Math.round(membershipFee) : 0,
+      membershipFee: fee,
+      isPago: fee > 0,
       leader: userId,
+      leaderStripeAccountId: req.user.stripeAccountId || '',
       members: [userId],
     })
+
+    // Criar Product + Price já no Stripe se grupo é pago
+    if (fee > 0) {
+      try {
+        if (!group.stripeProductId) {
+          const product = await stripe.products.create({
+            name: `Mensalidade ${group.name}`,
+            metadata: { groupId: String(group._id), leaderId: String(userId) },
+          })
+          group.stripeProductId = product.id
+        }
+        if (!group.stripePriceId) {
+          const price = await stripe.prices.create({
+            product:    group.stripeProductId,
+            unit_amount: fee,
+            currency:   'brl',
+            recurring:  { interval: 'month' },
+            metadata:   { groupId: String(group._id) },
+          })
+          group.stripePriceId = price.id
+        }
+        await group.save()
+      } catch (e) {
+        console.error('[GRUPOS] Falha ao criar Product/Price Stripe (grupo criado):', e.message)
+      }
+    }
 
     await Message.create({
       grupo: group._id, sender: userId,
@@ -390,6 +447,20 @@ router.put('/:id', validId, auth, async (req, res) => {
         }
       }
     })
+
+    // 🔒 BLOQUEIO ONBOARDING — virou grupo pago? exige onboarding
+    if (updates.membershipFee != null && updates.membershipFee >= 100) {
+      const leader = await User.findById(req.user.id).select(
+        'stripeAccountId stripeOnboardingDone chargesEnabled accountUnderReview suspendedUntil'
+      )
+      if (!leader?.stripeAccountId || !leader.stripeOnboardingDone || !leader.chargesEnabled) {
+        return res.status(403).json({
+          error: 'Para definir mensalidade você precisa concluir o cadastro financeiro primeiro.',
+          code: 'ONBOARDING_REQUIRED',
+          action: 'POST /api/connect/onboard',
+        })
+      }
+    }
 
     // Validações
     if (updates.name !== undefined) {

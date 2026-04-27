@@ -4,25 +4,46 @@ const PassengerSchema = new mongoose.Schema({
   user:             { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   name:             { type: String, required: true },
   handle:           { type: String, default: '' },
-  // authorized  = pagamento autorizado (requires_capture) — aguarda validação do código no embarque
-  // confirmed   = código validado pelo motorista, pagamento capturado
-  // paid        = legado / pagamentos de grupo
-  // cancelled   = cancelado
-  status:           { type: String, enum: ['reserved', 'authorized', 'paid', 'confirmed', 'cancelled'], default: 'reserved' },
-  capturedAt:       { type: Date, default: null },   // quando o motorista validou o código
-  paidAmount:       { type: Number, default: 0 },         // quanto pagou (simulado)
-  isMember:         { type: Boolean, default: false },     // era membro do grupo do motorista?
-  confirmedAt:      { type: Date, default: null },         // quando o passageiro confirmou a viagem
+  // ─── Status de pagamento do passageiro ────────────────────────────────────
+  // reserved   = legado
+  // authorized = PaymentIntent autorizado, aguardando captura (escrow)
+  // paid       = legado / pagamentos imediatos
+  // confirmed  = código validado, pagamento capturado e repassado
+  // cancelled  = reserva cancelada (estorno via Stripe)
+  // no_show    = passageiro não embarcou — captura parcial
+  // unvalidated= token expirou sem validação — split 46/46/8
+  status: {
+    type: String,
+    enum: ['reserved', 'authorized', 'paid', 'confirmed', 'cancelled', 'no_show', 'unvalidated'],
+    default: 'reserved',
+  },
+  capturedAt:       { type: Date, default: null },
+  paidAmount:       { type: Number, default: 0 },          // centavos
+  isMember:         { type: Boolean, default: false },
+  confirmedAt:      { type: Date, default: null },
   reservedAt:       { type: Date, default: Date.now },
 
-  // ─── Volta condicional ───────────────────────────────────────────────────────
+  // ─── Volta condicional ───────────────────────────────────────────────────
   returnApproved:    { type: Boolean, default: null },
   returnNote:        { type: String, default: '' },
   returnEvaluatedAt: { type: Date, default: null },
 
-  // ─── Código de validação (gerado pelo backend, mostrado no embarque) ──────────
+  // ─── Código de validação ──────────────────────────────────────────────────
+  // validationCode  : 4-letter token (legado, "TM-XXXX")
+  // paymentToken    : NOVO — bcrypt hash do código de 6 dígitos numéricos
+  //                  (nunca armazenamos o código bruto)
   validationCode:    { type: String, default: '' },
+  paymentToken:      { type: String, default: '' },         // bcrypt hash
   paymentIntentId:   { type: String, default: '' },
+
+  // ─── Snapshots financeiros (imutáveis após reserva) ───────────────────────
+  escrowAmount:      { type: Number, default: 0 },          // valor preso (centavos)
+  platformFee:       { type: Number, default: 0 },          // 8% calculado na reserva
+  tokenExpiresAt:    { type: Date, default: null },         // game.date + 24h
+  cancellationDeadline: { type: Date, default: null },      // departureTime - 2h
+
+  // ─── Idempotência do cron ─────────────────────────────────────────────────
+  processadoEm:      { type: Date, default: null },         // null até processado
 })
 
 const RideSchema = new mongoose.Schema({
@@ -30,6 +51,7 @@ const RideSchema = new mongoose.Schema({
   driver:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   driverName:     { type: String, required: true },
   driverHandle:   { type: String, default: '' },
+  driverStripeAccountId: { type: String, default: '' }, // snapshot — segurança contra troca
 
   // ─── Grupo (opcional — caravanas de líderes) ────
   group:          { type: mongoose.Schema.Types.ObjectId, ref: 'Group', default: null },
@@ -48,16 +70,16 @@ const RideSchema = new mongoose.Schema({
   totalSeats:     { type: Number, required: true, min: 1, max: 50 },
 
   // ─── Preço ──────────────────────────────────────
-  price:          { type: Number, required: true, min: 0 },        // preço normal por vaga (centavos)
-  memberPrice:    { type: Number, default: null },                  // preço para membros do grupo (centavos)
+  price:          { type: Number, required: true, min: 0 },
+  memberPrice:    { type: Number, default: null },
 
   // ─── Logística ──────────────────────────────────
-  meetPoint:      { type: String, required: true },                 // ponto de encontro
+  meetPoint:      { type: String, required: true },
   meetCoords: {
     lat:          { type: Number, default: null },
     lng:          { type: Number, default: null },
   },
-  departureTime:  { type: Date, required: true },                   // horário de saída
+  departureTime:  { type: Date, required: true },
   bairro:         { type: String, default: '' },
   zona:           { type: String, default: '' },
 
@@ -73,12 +95,12 @@ const RideSchema = new mongoose.Schema({
   driverConfirmed:   { type: Boolean, default: false },
   driverConfirmedAt: { type: Date, default: null },
 
-  // ─── Financeiro (simulado) ──────────────────────
-  escrowTotal:    { type: Number, default: 0 },          // total preso no app
-  releasedTotal:  { type: Number, default: 0 },          // total liberado pro motorista
-  appCommission:  { type: Number, default: 0 },          // 20% retido pelo app
+  // ─── Financeiro ─────────────────────────────────
+  escrowTotal:    { type: Number, default: 0 },
+  releasedTotal:  { type: Number, default: 0 },
+  appCommission:  { type: Number, default: 0 },
 
-  // 🆔 NOVO — código compartilhável (ex: V-48273)
+  // 🆔 Código compartilhável (ex: V-48273)
   shareCode:      { type: String, unique: true, sparse: true },
 
   // 🗑️ TTL — exclusão automática 7 dias após o jogo
@@ -88,7 +110,9 @@ const RideSchema = new mongoose.Schema({
 
 // ─── Virtuals ─────────────────────────────────────
 RideSchema.virtual('availableSeats').get(function () {
-  const active = this.passengers.filter(p => p.status !== 'cancelled').length
+  const active = this.passengers.filter(
+    p => !['cancelled', 'no_show', 'unvalidated'].includes(p.status)
+  ).length
   return this.totalSeats - active
 })
 
@@ -96,8 +120,7 @@ RideSchema.virtual('isCaravan').get(function () {
   return this.vehicle === 'van' || this.vehicle === 'onibus'
 })
 
-// Incluir virtuals no JSON
-RideSchema.set('toJSON', { virtuals: true })
+RideSchema.set('toJSON',   { virtuals: true })
 RideSchema.set('toObject', { virtuals: true })
 
 // ─── Índices ──────────────────────────────────────
@@ -106,12 +129,14 @@ RideSchema.index({ driver: 1 })
 RideSchema.index({ zona: 1, bairro: 1 })
 RideSchema.index({ shareCode: 1 })
 
-// 🗑️ TTL index — MongoDB exclui automaticamente quando expiresAt é ultrapassado
+// 🔎 Cron de tokens expirados — query principal
+RideSchema.index({ 'passengers.status': 1, 'passengers.tokenExpiresAt': 1 })
+
+// 🗑️ TTL index
 RideSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 })
 
 // 🆔 + 🗑️ Pre-save: gerar shareCode + calcular expiresAt
 RideSchema.pre('save', async function (next) {
-  // ShareCode
   if (!this.shareCode) {
     const Ride = mongoose.model('Ride')
     let code, exists = true
@@ -122,12 +147,9 @@ RideSchema.pre('save', async function (next) {
     }
     this.shareCode = code
   }
-
-  // ExpiresAt: 7 dias após a data do jogo
   if (this.game?.date && !this.expiresAt) {
     this.expiresAt = new Date(new Date(this.game.date).getTime() + 7 * 24 * 60 * 60 * 1000)
   }
-
   next()
 })
 

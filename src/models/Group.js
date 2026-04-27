@@ -6,6 +6,18 @@ const PendingMemberSchema = new mongoose.Schema({
   handle:   { type: String, default: '' },
   status:   { type: String, enum: ['pendingApproval', 'pendingPayment'], required: true },
   requestedAt: { type: Date, default: Date.now },
+  // Stripe — referências da cobrança em curso
+  stripePaymentIntentId: { type: String, default: '' },
+  stripeSubscriptionId:  { type: String, default: '' },
+}, { _id: false })
+
+const ActiveSubscriptionSchema = new mongoose.Schema({
+  user:                 { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  stripeSubscriptionId: { type: String, required: true },
+  status:               { type: String, default: 'active' }, // active | past_due | canceled
+  currentPeriodEnd:     { type: Date, default: null },
+  startedAt:            { type: Date, default: Date.now },
+  failedAttempts:       { type: Number, default: 0 },
 }, { _id: false })
 
 const GroupSchema = new mongoose.Schema({
@@ -18,47 +30,54 @@ const GroupSchema = new mongoose.Schema({
   privacy:          { type: String, enum: ['public','private'], default: 'public' },
   approvalRequired: { type: Boolean, default: false },
   leader:           { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  // snapshot do stripeAccountId do líder no momento da criação
+  leaderStripeAccountId: { type: String, default: '' },
 
-  // Membros ativos (acesso total ao grupo)
   members:          [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-
-  // Membros pendentes (aguardando aprovação ou pagamento)
   pendingMembers:   [PendingMemberSchema],
+  // Assinaturas ativas (recorrência mensal)
+  subscriptions:    [ActiveSubscriptionSchema],
 
   maxMembers:       { type: Number, default: 100 },
 
-  // 💰 Mensalidade (centavos, 0 = gratuito)
-  membershipFee:    { type: Number, default: 0 },
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STRIPE — Mensalidade via Subscriptions (Recorrência automática)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // membershipFee em centavos. 0 = grupo gratuito (sem subscription).
+  membershipFee:    { type: Number, default: 0, min: 0 },
+  // isPago é derivado, mas armazenado como flag para queries rápidas
+  isPago:           { type: Boolean, default: false, index: true },
+  // Product e Price do Stripe — criados na primeira ativação de mensalidade
+  stripeProductId:  { type: String, default: null },
+  stripePriceId:    { type: String, default: null },
 
-  // 🏷️ Tipo/categoria do grupo
   groupType:        { type: String, enum: ['misto', 'organizada', 'familia', 'feminino', 'jovem'], default: 'misto' },
 
-  // 📸 Foto do grupo (base64, max 800KB)
   photo:            { type: String, default: null },
 
-  // 📍 Localização do ponto de encontro
   location: {
     lat: { type: Number, default: null },
     lng: { type: Number, default: null },
   },
 
-  // 🆔 Código amigável de 7 dígitos (ex: 0000001)
   code:             { type: String, unique: true, sparse: true },
 
 }, { timestamps: true })
 
-// Índice para evitar duplicidade de nome+time+bairro
 GroupSchema.index({ name: 1, team: 1, bairro: 1 }, { unique: true })
+GroupSchema.index({ leader: 1 })
 
-// 🆔 Gerar código sequencial de 7 dígitos antes de salvar
 GroupSchema.pre('save', async function (next) {
-  if (this.code) return next() // já tem código
+  // Derivar flag isPago
+  this.isPago = (this.membershipFee || 0) > 0
 
-  const Group = mongoose.model('Group')
-  // Buscar o maior código existente
-  const last = await Group.findOne({ code: { $ne: null } }).sort({ code: -1 }).select('code').lean()
-  const nextNum = last?.code ? parseInt(last.code) + 1 : 1
-  this.code = String(nextNum).padStart(7, '0')
+  // Gerar code de 7 dígitos
+  if (!this.code) {
+    const Group = mongoose.model('Group')
+    const last = await Group.findOne({ code: { $ne: null } }).sort({ code: -1 }).select('code').lean()
+    const nextNum = last?.code ? parseInt(last.code) + 1 : 1
+    this.code = String(nextNum).padStart(7, '0')
+  }
 
   next()
 })

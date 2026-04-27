@@ -23,6 +23,7 @@ const connectRoutes  = require('./routes/connect')
 const walletRoutes   = require('./routes/wallet')
 const Group         = require('./models/Group')
 const Ride          = require('./models/Ride')
+const { startExpiredTokensCron } = require('./cron/expiredTokens')
 
 const app    = express()
 const server = http.createServer(app)
@@ -241,6 +242,10 @@ mongoose.connect(process.env.MONGODB_URI)
     server.listen(PORT, () => {
       console.log(`🚀 TorcidaMatch API rodando na porta ${PORT}`)
       console.log(`🔌 WebSocket ativo (com autenticação JWT)`)
+
+      // ⏰ Cron — tokens expirados (Cenário 4: split 46/46/8)
+      const cron = startExpiredTokensCron()
+      if (cron) console.log('⏰ Cron de tokens expirados ativo (intervalo 1h)')
     })
   })
   .catch(err => {

@@ -6,8 +6,8 @@ const Message      = require('../models/Message')
 const Notification = require('../models/Notification')
 const StripeEvent  = require('../models/StripeEvent')
 const Transaction  = require('../models/Transaction')
+const penalties    = require('../services/penalties')
 
-// 💳 Stripe — chaves selecionadas automaticamente (test/live) por NODE_ENV
 const { stripe, webhookSecret } = require('../config/stripe')
 
 const router = express.Router()
@@ -15,85 +15,86 @@ const router = express.Router()
 // ═══════════════════════════════════════════════════════════════════════════════
 // POST /api/webhook
 //
-// IMPORTANTE:
-// - O body DEVE ser raw (Buffer) para validar a assinatura
-// - NÃO use express.json() neste endpoint — configurado no server.js
-// - SEMPRE valide a assinatura antes de processar qualquer evento
+// Webhooks essenciais (TorcidaMATCH_Financeiro_Stripe — seção 11):
+//   payment_intent.succeeded      → mensalidade paga / captura concluída
+//   payment_intent.payment_failed → notifica usuário
+//   account.updated               → atualiza stripeOnboarded/charges/payouts
+//   invoice.paid                  → mensalidade recorrente recebida
+//   invoice.payment_failed        → mensalidade falhou (suspender após 3)
+//   customer.subscription.deleted → assinatura cancelada → remover do grupo
+//   payout.paid                   → saque chegou na conta bancária
+//   payout.failed                 → saque falhou
+//   charge.dispute.created        → chargeback → suspender conta
+//   charge.refunded               → reembolso processado
+//
+// REGRAS:
+//   - SEMPRE validar a assinatura com STRIPE_WEBHOOK_SECRET
+//   - SEMPRE checar idempotência via StripeEvent (evita reprocessar)
+//   - Responder 200 RAPIDAMENTE — processamento assíncrono
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post('/', async (req, res) => {
   const sig = req.headers['stripe-signature']
-
-  if (!sig) {
-    console.error('[WEBHOOK] Assinatura ausente')
-    return res.status(400).json({ error: 'Assinatura do webhook ausente' })
-  }
+  if (!sig) return res.status(400).json({ error: 'Assinatura ausente' })
 
   let event
-
-  // ─── 1. Validar assinatura do webhook ────────────────────────────────────────
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,  // DEVE ser Buffer/raw — configurado no server.js
-      sig,
-      webhookSecret
-    )
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret)
   } catch (err) {
     console.error(`[WEBHOOK] Assinatura inválida: ${err.message}`)
     return res.status(400).json({ error: 'Assinatura inválida' })
   }
 
-  // ─── 2. Idempotência — verificar se já processamos este evento ──────────────
+  // Idempotência — verificar se já processamos
   try {
     const existing = await StripeEvent.findOne({ eventId: event.id })
     if (existing) {
-      console.log(`[WEBHOOK] Evento já processado (idempotente): ${event.id}`)
+      console.log(`[WEBHOOK] Duplicado: ${event.id}`)
       return res.status(200).json({ received: true, duplicate: true })
     }
   } catch (err) {
-    console.error(`[WEBHOOK] Erro ao verificar idempotência: ${err.message}`)
-    // Continuar processando — melhor processar duas vezes do que perder
+    console.error('[WEBHOOK] check idempotência:', err.message)
   }
 
-  // ─── 3. Retornar 200 rapidamente — processar de forma assíncrona ───────────
   res.status(200).json({ received: true })
 
-  // Processamento assíncrono (não bloqueia o Stripe)
   processEvent(event).catch(err => {
-    console.error(`[WEBHOOK] Erro ao processar evento ${event.id}: ${err.message}`)
+    console.error(`[WEBHOOK] erro evento ${event.id}: ${err.message}`)
   })
 })
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Processamento assíncrono dos eventos
-// ═══════════════════════════════════════════════════════════════════════════════
 async function processEvent(event) {
   const { type, data, id: eventId } = event
-  const paymentIntent = data.object
-
-  console.log(`[WEBHOOK] Processando: ${type} | PI: ${paymentIntent.id}`)
+  console.log(`[WEBHOOK] Processando: ${type} | id=${eventId}`)
 
   switch (type) {
+    // ─── PaymentIntent ────────────────────────────────────────────────────
     case 'payment_intent.succeeded':
-      // Para viagens: succeeded dispara APÓS stripe.paymentIntents.capture() no validate-code.
-      // O crédito do motorista já foi feito lá — webhook só processa group_membership aqui.
-      await handlePaymentSucceeded(paymentIntent)
+      await handlePaymentSucceeded(data.object)
       break
 
     case 'payment_intent.amount_capturable_updated':
-      // Disparado quando o passageiro autorizou (requires_capture).
-      // confirm-ride já registrou o passageiro — só logamos aqui.
-      console.log(`[WEBHOOK] PI autorizado (aguarda validação): ${paymentIntent.id}`)
+      // PI autorizado (escrow ativo) — confirm-ride já tratou
+      console.log(`[WEBHOOK] PI autorizado: ${data.object.id}`)
       break
 
     case 'payment_intent.payment_failed':
-      await handlePaymentFailed(paymentIntent)
+      await handlePaymentFailed(data.object)
       break
 
+    case 'payment_intent.canceled':
+      console.log(`[WEBHOOK] PI cancelado: ${data.object.id}`)
+      break
+
+    // ─── Charge ───────────────────────────────────────────────────────────
     case 'charge.refunded':
       await handleChargeRefunded(data.object)
       break
 
-    // ─── Eventos Stripe Connect ────────────────────────────────────────────────
+    case 'charge.dispute.created':
+      await handleChargebackOpened(data.object)
+      break
+
+    // ─── Connect Account ──────────────────────────────────────────────────
     case 'account.updated':
       await handleAccountUpdated(data.object)
       break
@@ -102,261 +103,169 @@ async function processEvent(event) {
       console.log(`[WEBHOOK] Transfer criado: ${data.object.id} → ${data.object.destination}`)
       break
 
+    // ─── Subscriptions / Invoices ─────────────────────────────────────────
+    case 'invoice.paid':
+    case 'invoice.payment_succeeded':
+      await handleInvoicePaid(data.object)
+      break
+
+    case 'invoice.payment_failed':
+      await handleInvoiceFailed(data.object)
+      break
+
+    case 'customer.subscription.deleted':
+      await handleSubscriptionDeleted(data.object)
+      break
+
+    // ─── Payouts ──────────────────────────────────────────────────────────
+    case 'payout.paid':
+      await handlePayoutPaid(data.object, event.account)
+      break
+
+    case 'payout.failed':
+      await handlePayoutFailed(data.object, event.account)
+      break
+
     default:
-      console.log(`[WEBHOOK] Evento não tratado: ${type}`)
+      console.log(`[WEBHOOK] Ignorando: ${type}`)
   }
 
-  // ─── 4. Registrar evento como processado (idempotência) ──────────────────────
+  // Marcar como processado
   try {
     await StripeEvent.create({
-      eventId,
-      type,
-      data: {
-        paymentIntentId: paymentIntent.id,
-        amount: paymentIntent.amount,
-        metadata: paymentIntent.metadata,
-      },
+      eventId, type,
+      data: { objectId: data.object?.id, type: data.object?.object || null },
     })
   } catch (err) {
-    // Se falhar por duplicata (race condition), tudo bem
-    if (err.code !== 11000) {
-      console.error(`[WEBHOOK] Erro ao salvar evento: ${err.message}`)
-    }
+    if (err.code !== 11000) console.error('[WEBHOOK] save event:', err.message)
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Handler: payment_intent.succeeded
+// payment_intent.succeeded
 // ═══════════════════════════════════════════════════════════════════════════════
 async function handlePaymentSucceeded(paymentIntent) {
   const { metadata } = paymentIntent
-
-  if (metadata.type === 'group_membership') {
+  if (metadata?.type === 'group_membership') {
     await handleGroupPaymentSuccess(paymentIntent)
-  } else if (metadata.type === 'ride_reservation') {
+  } else if (metadata?.type === 'ride_reservation') {
     await handleRidePaymentSuccess(paymentIntent)
   } else {
-    console.log(`[WEBHOOK] Tipo de pagamento desconhecido: ${metadata.type}`)
+    console.log(`[WEBHOOK] PI succeeded sem type: ${paymentIntent.id}`)
   }
 }
 
-// ─── Pagamento de mensalidade de grupo aprovado ─────────────────────────────
+// ─── Mensalidade de grupo paga (cobrança única) ─────────────────────────────
 async function handleGroupPaymentSuccess(paymentIntent) {
-  const { groupId, userId, userName } = paymentIntent.metadata
+  const { groupId, userId, userName, leaderUserId } = paymentIntent.metadata
+  if (!groupId || !userId) return
 
-  try {
-    const group = await Group.findById(groupId)
-    if (!group) {
-      console.error(`[WEBHOOK] Grupo não encontrado: ${groupId}`)
-      return
-    }
+  const group = await Group.findById(groupId)
+  if (!group) return
 
-    // Remover de pendingMembers e adicionar a members
-    const pending = group.pendingMembers?.find(
-      p => String(p.user) === userId
-    )
-    if (!pending) {
-      console.log(`[WEBHOOK] Usuário ${userId} não está pendente no grupo ${groupId}`)
-      return
-    }
+  const pending = group.pendingMembers?.find(p => String(p.user) === userId)
+  if (!pending) return
 
-    group.pendingMembers = group.pendingMembers.filter(
-      p => String(p.user) !== userId
-    )
-    group.members.push(userId)
-    await group.save()
+  group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== userId)
+  group.members.push(userId)
+  await group.save()
 
-    // Mensagem no chat do grupo
-    await Message.create({
-      grupo: group._id,
-      sender: userId,
-      senderName: userName || 'Membro',
-      text: `${userName || 'Membro'} entrou no grupo (pagamento confirmado via Stripe)`,
-      type: 'system',
-    })
+  await Message.create({
+    grupo: group._id, sender: userId, senderName: userName || 'Membro',
+    text: `${userName || 'Membro'} entrou no grupo (pagamento confirmado)`,
+    type: 'system',
+  }).catch(() => {})
 
-    // Notificação para o novo membro
-    await Notification.create({
-      user: userId,
-      type: 'group_payment_confirmed',
+  await Promise.allSettled([
+    Notification.create({
+      user: userId, type: 'group_payment_confirmed',
       title: 'Pagamento confirmado!',
-      message: `Seu pagamento para o grupo ${group.name} foi confirmado. Bem-vindo!`,
+      message: `Pagamento confirmado. Bem-vindo ao grupo ${group.name}!`,
       group: group._id,
-    })
-
-    // Notificação para o líder
-    await Notification.create({
-      user: group.leader,
-      type: 'group_payment_received',
+    }),
+    Notification.create({
+      user: leaderUserId || group.leader, type: 'group_payment_received',
       title: 'Pagamento recebido',
       message: `${userName} pagou a mensalidade do grupo ${group.name}.`,
-      group: group._id,
-      fromUser: userId,
-      fromName: userName,
-    })
+      group: group._id, fromUser: userId, fromName: userName,
+    }),
+  ])
 
-    // ─── Carteira do líder: creditar 80% da mensalidade ─────────────────────
-    const totalAmount    = paymentIntent.amount           // centavos
-    const appCommission  = Math.round(totalAmount * 0.20) // 20% plataforma
-    const leaderCredit   = totalAmount - appCommission    // 80% para o líder
+  // Transações imutáveis (Stripe já transferiu via transfer_data)
+  const total = paymentIntent.amount
+  const fee   = paymentIntent.application_fee_amount || Math.round(total * 0.20)
+  const leaderCredit = total - fee
 
-    await User.findByIdAndUpdate(group.leader, {
-      $inc: { walletBalance: leaderCredit },
-    })
-
-    // Transação do líder (crédito na carteira)
-    await Transaction.create({
-      userId:      group.leader,
-      type:        'deposit',
-      amount:      leaderCredit,
-      status:      'completed',
+  await Promise.allSettled([
+    Transaction.create({
+      userId: leaderUserId || group.leader,
+      type: 'group_earning', direction: 'credit',
+      amount: leaderCredit, status: 'completed',
       description: `Mensalidade de ${userName} — grupo ${group.name}`,
-      relatedId:   group._id,
-      relatedType: 'group',
+      relatedId: group._id, relatedType: 'group',
       stripePaymentIntentId: paymentIntent.id,
-      appCommission,
-    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (líder):', e.message))
-
-    // Transação do membro (pagamento)
-    await Transaction.create({
-      userId:      userId,
-      type:        'payment',
-      amount:      totalAmount,
-      status:      'completed',
+      appCommission: fee,
+    }),
+    Transaction.create({
+      userId, type: 'group_subscription', direction: 'debit',
+      amount: total, status: 'completed',
       description: `Mensalidade — grupo ${group.name}`,
-      relatedId:   group._id,
-      relatedType: 'group',
+      relatedId: group._id, relatedType: 'group',
       stripePaymentIntentId: paymentIntent.id,
-      appCommission,
-    }).catch(e => console.error('[WEBHOOK] Falha ao registrar Transaction (membro):', e.message))
+      appCommission: fee,
+    }),
+  ])
 
-    console.log(`[WEBHOOK] Grupo ${groupId}: membro ${userId} ativado | líder creditado R$ ${(leaderCredit / 100).toFixed(2)}`)
-  } catch (err) {
-    console.error(`[WEBHOOK] Erro ao processar pagamento de grupo: ${err.message}`)
-    throw err // re-throw para log no processEvent
-  }
+  console.log(`[WEBHOOK] grupo ${groupId}: membro ${userId} ativado | fee=${fee} líder=${leaderCredit}`)
 }
 
-// ─── Pagamento de viagem capturado (succeeded após validate-code) ────────────
+// ─── Captura de viagem concluída ────────────────────────────────────────────
 async function handleRidePaymentSuccess(paymentIntent) {
-  const { rideId, userId, userName } = paymentIntent.metadata
-
-  try {
-    // Com capture_method:'manual', payment_intent.succeeded só dispara
-    // DEPOIS de stripe.paymentIntents.capture() no endpoint validate-code.
-    // O crédito do motorista já foi feito lá — aqui só verificamos se
-    // o passageiro já está confirmado e registramos backup se necessário.
-    const alreadyCredited = await Transaction.findOne({
-      stripePaymentIntentId: paymentIntent.id,
-      type:   'deposit',
-    })
-
-    if (alreadyCredited) {
-      // validate-code já processou tudo — nada a fazer
-      console.log(`[WEBHOOK] Ride ${rideId}: succeeded recebido, crédito já processado via validate-code`)
-      return
-    }
-
-    // Edge case: validate-code falhou mas Stripe capturou (retry / fallback)
-    const ride = await Ride.findById(rideId)
-    if (!ride) { console.error(`[WEBHOOK] Viagem não encontrada: ${rideId}`); return }
-
-    const amount = paymentIntent.amount_received || paymentIntent.amount
-    const appCommission = Math.round(amount * 0.20)
-    const driverCredit  = amount - appCommission
-
-    await User.findByIdAndUpdate(ride.driver, { $inc: { walletBalance: driverCredit } })
-
-    await Transaction.create({
-      userId:      ride.driver,
-      type:        'deposit',
-      amount:      driverCredit,
-      status:      'completed',
-      description: `[Fallback webhook] Embarque ${userName} — viagem ${ride.shareCode}`,
-      relatedId:   ride._id,
-      relatedType: 'ride',
-      stripePaymentIntentId: paymentIntent.id,
-      appCommission,
-    }).catch(e => console.error('[WEBHOOK] Falha Transaction motorista fallback:', e.message))
-
-    // Atualizar passageiro para confirmed se ainda estiver authorized
-    const passenger = ride.passengers.find(
-      p => String(p.user) === userId && p.status === 'authorized'
-    )
-    if (passenger) {
-      passenger.status = 'confirmed'
-      passenger.capturedAt = new Date()
-      await ride.save()
-    }
-
-    console.log(`[WEBHOOK] Viagem ${rideId}: fallback — motorista creditado R$ ${(driverCredit / 100).toFixed(2)}`)
-
-    console.log(`[WEBHOOK] Viagem ${rideId}: passageiro ${userId} processado com sucesso`)
-  } catch (err) {
-    console.error(`[WEBHOOK] Erro ao processar pagamento de viagem: ${err.message}`)
-    throw err
+  const { rideId, userId } = paymentIntent.metadata
+  // validate-code já registrou a transação ride_earn — apenas backup
+  const already = await Transaction.findOne({
+    stripePaymentIntentId: paymentIntent.id, type: 'ride_earn',
+  })
+  if (already) {
+    console.log(`[WEBHOOK] ride ${rideId}: já processado em validate-code`)
+    return
   }
-}
-
-// ─── Conta Connect atualizada ─────────────────────────────────────────────────
-async function handleAccountUpdated(account) {
-  try {
-    const userId = account.metadata?.userId
-    if (!userId) return
-
-    const onboardingDone = account.details_submitted && account.charges_enabled
-
-    await User.findByIdAndUpdate(userId, { stripeOnboardingDone: onboardingDone })
-    console.log(`[WEBHOOK] Conta Connect ${account.id}: onboarding=${onboardingDone} | user=${userId}`)
-  } catch (err) {
-    console.error(`[WEBHOOK] Erro ao atualizar conta Connect: ${err.message}`)
-  }
+  console.log(`[WEBHOOK] ride ${rideId}: succeeded sem ride_earn (edge case)`)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Handler: payment_intent.payment_failed
+// payment_intent.payment_failed
 // ═══════════════════════════════════════════════════════════════════════════════
 async function handlePaymentFailed(paymentIntent) {
-  const { metadata } = paymentIntent
-  const { userId, userName } = metadata
-
+  const { userId } = paymentIntent.metadata || {}
   if (!userId) return
-
   const errorMessage = paymentIntent.last_payment_error?.message || 'Pagamento recusado'
 
-  // Notificar o usuário sobre a falha
   await Notification.create({
-    user: userId,
-    type: 'payment_failed',
+    user: userId, type: 'payment_failed',
     title: 'Pagamento falhou',
-    message: `Seu pagamento não foi processado: ${errorMessage}. Tente novamente.`,
-  })
-
-  console.log(`[WEBHOOK] Pagamento falhou: PI=${paymentIntent.id} | user=${userId} | erro=${errorMessage}`)
+    message: `Seu pagamento não foi processado: ${errorMessage}`,
+  }).catch(() => {})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Handler: charge.refunded
+// charge.refunded
 // ═══════════════════════════════════════════════════════════════════════════════
 async function handleChargeRefunded(charge) {
-  const paymentIntentId = charge.payment_intent
-
-  if (!paymentIntentId) return
-
+  const piId = charge.payment_intent
+  if (!piId) return
   try {
-    // Buscar o PaymentIntent para obter metadata
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId)
-    const { metadata } = paymentIntent
-    const { userId, type: paymentType, rideId } = metadata
+    const pi = await stripe.paymentIntents.retrieve(piId)
+    const { userId, type, rideId } = pi.metadata || {}
 
-    if (paymentType === 'ride_reservation' && rideId) {
+    if (type === 'ride_reservation' && rideId) {
       const ride = await Ride.findById(rideId)
       if (ride) {
         const passenger = ride.passengers.find(
-          p => String(p.user) === userId && p.status !== 'cancelled'
+          p => String(p.user) === userId && !['cancelled', 'no_show', 'unvalidated'].includes(p.status)
         )
         if (passenger) {
-          ride.escrowTotal -= passenger.paidAmount
+          ride.escrowTotal -= (passenger.escrowAmount || passenger.paidAmount || 0)
           passenger.status = 'cancelled'
           if (ride.status === 'full') ride.status = 'open'
           await ride.save()
@@ -366,17 +275,261 @@ async function handleChargeRefunded(charge) {
 
     if (userId) {
       await Notification.create({
-        user: userId,
-        type: 'payment_refunded',
+        user: userId, type: 'payment_refunded',
         title: 'Reembolso processado',
-        message: `Seu reembolso de R$ ${(charge.amount_refunded / 100).toFixed(2)} foi processado.`,
-      })
+        message: `Reembolso de R$ ${(charge.amount_refunded / 100).toFixed(2)} processado.`,
+      }).catch(() => {})
+    }
+  } catch (err) {
+    console.error('[WEBHOOK] charge.refunded:', err.message)
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// charge.dispute.created — chargeback aberto
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleChargebackOpened(dispute) {
+  try {
+    const charge = await stripe.charges.retrieve(dispute.charge)
+    const piId = charge.payment_intent
+    if (!piId) return
+    const pi = await stripe.paymentIntents.retrieve(piId)
+    const { userId } = pi.metadata || {}
+    if (!userId) return
+
+    await penalties.registerChargeback(userId, { disputeId: dispute.id }).catch(() => {})
+
+    await Transaction.create({
+      userId, type: 'chargeback', direction: 'debit',
+      amount: dispute.amount, status: 'completed',
+      description: `Chargeback aberto — disputa ${dispute.id}`,
+      stripePaymentIntentId: piId,
+      stripeChargeId: dispute.charge,
+    }).catch(() => {})
+
+    console.log(`[WEBHOOK] CHARGEBACK user=${userId} | dispute=${dispute.id} | amount=${dispute.amount}`)
+  } catch (err) {
+    console.error('[WEBHOOK] dispute.created:', err.message)
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// account.updated — onboarding / capacidades
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleAccountUpdated(account) {
+  try {
+    const userId = account.metadata?.userId
+    if (!userId) {
+      // Buscar pelo accountId se metadata foi perdida
+      const user = await User.findOne({ stripeAccountId: account.id })
+      if (!user) return
+      account.metadata = account.metadata || {}
+      account.metadata.userId = String(user._id)
     }
 
-    console.log(`[WEBHOOK] Reembolso processado: charge=${charge.id} | amount=${charge.amount_refunded}`)
+    const onboardingDone = !!(account.details_submitted && account.charges_enabled)
+    const update = {
+      stripeOnboardingDone: onboardingDone,
+      stripeOnboarded:      onboardingDone,
+      chargesEnabled:       !!account.charges_enabled,
+      payoutsEnabled:       !!account.payouts_enabled,
+    }
+
+    const before = await User.findById(account.metadata.userId).select('stripeOnboardingDone')
+    await User.findByIdAndUpdate(account.metadata.userId, update)
+
+    // Notificação na primeira aprovação
+    if (onboardingDone && !before?.stripeOnboardingDone) {
+      await Notification.create({
+        user: account.metadata.userId,
+        type: 'connect_onboarded',
+        title: 'Cadastro financeiro aprovado! 🎉',
+        message: 'Sua conta está pronta para receber pagamentos.',
+      }).catch(() => {})
+    }
+
+    // Alerta se payouts foram desabilitados
+    if (!account.payouts_enabled && account.requirements?.disabled_reason) {
+      await Notification.create({
+        user: account.metadata.userId,
+        type: 'connect_payouts_disabled',
+        title: 'Atenção: saques bloqueados',
+        message: `Stripe sinalizou: ${account.requirements.disabled_reason}. Atualize seus dados.`,
+      }).catch(() => {})
+    }
+
+    console.log(`[WEBHOOK] account.updated ${account.id}: onboarded=${onboardingDone}`)
   } catch (err) {
-    console.error(`[WEBHOOK] Erro ao processar reembolso: ${err.message}`)
+    console.error('[WEBHOOK] account.updated:', err.message)
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// invoice.paid (Subscriptions — mensalidade recorrente)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleInvoicePaid(invoice) {
+  const subId = invoice.subscription
+  if (!subId) return
+  try {
+    const sub = await stripe.subscriptions.retrieve(subId)
+    const { groupId, userId } = sub.metadata || {}
+    if (!groupId || !userId) return
+
+    const group = await Group.findById(groupId)
+    if (!group) return
+
+    // Adicionar ao grupo se ainda não está
+    const isMember = group.members.map(String).includes(userId)
+    if (!isMember) {
+      group.pendingMembers = group.pendingMembers.filter(p => String(p.user) !== userId)
+      group.members.push(userId)
+    }
+
+    // Atualizar/criar registro de subscription ativa
+    let subRec = group.subscriptions.find(s => s.stripeSubscriptionId === subId)
+    if (!subRec) {
+      group.subscriptions.push({
+        user: userId,
+        stripeSubscriptionId: subId,
+        status: 'active',
+        currentPeriodEnd: new Date(sub.current_period_end * 1000),
+        startedAt: new Date(),
+        failedAttempts: 0,
+      })
+    } else {
+      subRec.status = 'active'
+      subRec.currentPeriodEnd = new Date(sub.current_period_end * 1000)
+      subRec.failedAttempts = 0
+    }
+    await group.save()
+
+    // Transação para histórico
+    const total = invoice.amount_paid
+    const fee   = invoice.application_fee_amount || Math.round(total * 0.20)
+    await Transaction.create({
+      userId: group.leader, type: 'group_earning', direction: 'credit',
+      amount: total - fee, status: 'completed',
+      description: `Mensalidade recorrente — grupo ${group.name}`,
+      relatedId: group._id, relatedType: 'group',
+      stripeSubscriptionId: subId,
+      stripeInvoiceId: invoice.id,
+      appCommission: fee,
+    }).catch(() => {})
+
+    console.log(`[WEBHOOK] invoice.paid sub=${subId} grupo=${groupId} user=${userId}`)
+  } catch (err) {
+    console.error('[WEBHOOK] invoice.paid:', err.message)
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// invoice.payment_failed — após 3 tentativas, remover do grupo
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleInvoiceFailed(invoice) {
+  const subId = invoice.subscription
+  if (!subId) return
+  try {
+    const sub = await stripe.subscriptions.retrieve(subId)
+    const { groupId, userId } = sub.metadata || {}
+    if (!groupId || !userId) return
+
+    const group = await Group.findById(groupId)
+    if (!group) return
+
+    let subRec = group.subscriptions.find(s => s.stripeSubscriptionId === subId)
+    if (subRec) {
+      subRec.failedAttempts = (subRec.failedAttempts || 0) + 1
+      subRec.status = 'past_due'
+      await group.save()
+
+      if (subRec.failedAttempts >= 3) {
+        // Cancelar subscription e remover do grupo
+        await stripe.subscriptions.cancel(subId).catch(() => {})
+        group.members = group.members.filter(m => String(m) !== userId)
+        group.subscriptions = group.subscriptions.filter(s => s.stripeSubscriptionId !== subId)
+        await group.save()
+
+        await Notification.create({
+          user: userId, type: 'subscription_cancelled',
+          title: 'Acesso ao grupo suspenso',
+          message: `Seu pagamento falhou 3 vezes. Você foi removido do grupo ${group.name}.`,
+          group: group._id,
+        }).catch(() => {})
+      } else {
+        await Notification.create({
+          user: userId, type: 'invoice_failed',
+          title: 'Pagamento falhou',
+          message: `A cobrança da mensalidade do grupo ${group.name} falhou (${subRec.failedAttempts}/3).`,
+          group: group._id,
+        }).catch(() => {})
+      }
+    }
+  } catch (err) {
+    console.error('[WEBHOOK] invoice.payment_failed:', err.message)
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// customer.subscription.deleted
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleSubscriptionDeleted(sub) {
+  const { groupId, userId } = sub.metadata || {}
+  if (!groupId || !userId) return
+  try {
+    const group = await Group.findById(groupId)
+    if (!group) return
+    group.members = group.members.filter(m => String(m) !== userId)
+    group.subscriptions = group.subscriptions.filter(s => s.stripeSubscriptionId !== sub.id)
+    await group.save()
+
+    await Notification.create({
+      user: userId, type: 'subscription_cancelled',
+      title: 'Assinatura cancelada',
+      message: `Sua assinatura do grupo ${group.name} foi cancelada.`,
+      group: group._id,
+    }).catch(() => {})
+  } catch (err) {
+    console.error('[WEBHOOK] subscription.deleted:', err.message)
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// payout.paid — saque chegou na conta bancária
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handlePayoutPaid(payout, accountId) {
+  if (!accountId) return
+  const user = await User.findOne({ stripeAccountId: accountId })
+  if (!user) return
+
+  await Notification.create({
+    user: user._id, type: 'payout_paid',
+    title: 'Saque concluído!',
+    message: `R$ ${(payout.amount / 100).toFixed(2)} foi depositado na sua conta bancária.`,
+  }).catch(() => {})
+
+  await Transaction.findOneAndUpdate(
+    { stripePayoutId: payout.id },
+    { status: 'completed' }
+  ).catch(() => {})
+
+  console.log(`[WEBHOOK] payout.paid ${payout.id} → user ${user._id}`)
+}
+
+async function handlePayoutFailed(payout, accountId) {
+  if (!accountId) return
+  const user = await User.findOne({ stripeAccountId: accountId })
+  if (!user) return
+
+  await Notification.create({
+    user: user._id, type: 'payout_failed',
+    title: 'Saque falhou',
+    message: `O saque de R$ ${(payout.amount / 100).toFixed(2)} falhou. Verifique seus dados bancários.`,
+  }).catch(() => {})
+
+  await Transaction.findOneAndUpdate(
+    { stripePayoutId: payout.id },
+    { status: 'failed' }
+  ).catch(() => {})
 }
 
 module.exports = router
