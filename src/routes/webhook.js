@@ -13,6 +13,113 @@ const { stripe, webhookSecret } = require('../config/stripe')
 const router = express.Router()
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// THIN WEBHOOK V2 — POST /api/webhook/v2
+//
+// Eventos da Stripe Connect v2 (Accounts v2) chegam como "thin events".
+// Diferente do v1, o thin event não traz o objeto completo — apenas a referência.
+// Você usa eventNotif.fetchRelatedObject() / fetchEvent() para hidratar.
+//
+// Eventos esperados (v2):
+//   v2.account.created               — nova Connected Account criada
+//   v2.account.updated               — capabilities/requirements mudaram
+//   v2.account.requirements.updated  — KYC pendente/atualizado
+//
+// Configurar separadamente no dashboard: webhook v2 com endpoint /api/webhook/v2
+// O webhook v1 (eventos clássicos) continua em /api/webhook (definido abaixo).
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post('/v2', async (req, res) => {
+  const signature = req.headers['stripe-signature']
+  if (!signature) return res.status(400).json({ error: 'Assinatura ausente' })
+
+  if (!stripe.parseEventNotification) {
+    return res.status(501).json({ error: 'SDK Stripe sem suporte a thin events (v2)' })
+  }
+
+  const v2Secret = process.env.STRIPE_V2_WEBHOOK_SECRET || webhookSecret
+  let eventNotif
+  try {
+    eventNotif = stripe.parseEventNotification(req.body, signature, v2Secret)
+  } catch (err) {
+    console.error('[WEBHOOK V2] Assinatura inválida:', err.message)
+    return res.status(400).json({ error: 'Assinatura inválida' })
+  }
+
+  // Resposta rápida — processamento assíncrono
+  res.status(200).json({ received: true })
+
+  ;(async () => {
+    try {
+      const type = eventNotif.type
+      console.log(`[WEBHOOK V2] ${type}`)
+
+      switch (type) {
+        case 'v2.account.created': {
+          const related = await eventNotif.fetchRelatedObject()
+          await handleV2AccountCreated(related)
+          break
+        }
+        case 'v2.account.updated':
+        case 'v2.account.requirements.updated': {
+          const related = await eventNotif.fetchRelatedObject()
+          await handleV2AccountUpdated(related)
+          break
+        }
+        default:
+          console.log(`[WEBHOOK V2] Ignorando: ${type}`)
+      }
+    } catch (err) {
+      console.error('[WEBHOOK V2] erro processamento:', err.message)
+    }
+  })()
+})
+
+async function handleV2AccountCreated(account) {
+  if (!account?.id) return
+  const userId = account.metadata?.userId
+  if (!userId) return
+  console.log(`[WEBHOOK V2] account.created ${account.id} → user ${userId}`)
+  await User.findByIdAndUpdate(userId, { stripeAccountId: account.id }).catch(() => {})
+}
+
+async function handleV2AccountUpdated(account) {
+  if (!account?.id) return
+  let userId = account.metadata?.userId
+  if (!userId) {
+    const u = await User.findOne({ stripeAccountId: account.id }).select('_id')
+    userId = u?._id
+  }
+  if (!userId) return
+
+  // Parse v2 status
+  const recipient = account.configuration?.recipient
+  const balance   = recipient?.capabilities?.stripe_balance
+  const chargesEnabled = balance?.stripe_transfers?.status === 'active'
+  const payoutsEnabled = balance?.payouts?.status === 'active'
+  const summaryStatus  = account.requirements?.summary?.minimum_deadline?.status
+  const detailsSubmitted = !summaryStatus || summaryStatus === 'eventually_due'
+  const onboardingDone = !!(detailsSubmitted && chargesEnabled)
+
+  const before = await User.findById(userId).select('stripeOnboardingDone')
+  await User.findByIdAndUpdate(userId, {
+    stripeOnboardingDone: onboardingDone,
+    stripeOnboarded:      onboardingDone,
+    chargesEnabled,
+    payoutsEnabled,
+  })
+
+  if (onboardingDone && !before?.stripeOnboardingDone) {
+    await Notification.create({
+      user: userId,
+      type: 'connect_onboarded',
+      title: 'Cadastro financeiro aprovado!',
+      message: 'Sua conta está pronta para receber pagamentos.',
+    }).catch(() => {})
+  }
+
+  console.log(`[WEBHOOK V2] account.updated ${account.id} | onboarded=${onboardingDone}`)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // POST /api/webhook
 //
 // Webhooks essenciais (TorcidaMATCH_Financeiro_Stripe — seção 11):
@@ -530,6 +637,91 @@ async function handlePayoutFailed(payout, accountId) {
     { stripePayoutId: payout.id },
     { status: 'failed' }
   ).catch(() => {})
+}
+
+module.exports = router
+groupId, userId } = sub.metadata || {}
+    if (!groupId || !userId) return
+
+    const group = await Group.findById(groupId)
+    if (!group) return
+
+    let subRec = group.subscriptions.find(s => s.stripeSubscriptionId === subId)
+    if (subRec) {
+      subRec.failedAttempts = (subRec.failedAttempts || 0) + 1
+      subRec.status = 'past_due'
+      await group.save()
+
+      if (subRec.failedAttempts >= 3) {
+        await stripe.subscriptions.cancel(subId).catch(() => {})
+        group.members = group.members.filter(m => String(m) !== userId)
+        group.subscriptions = group.subscriptions.filter(s => s.stripeSubscriptionId !== subId)
+        await group.save()
+
+        await Notification.create({
+          user: userId, type: 'subscription_cancelled',
+          title: 'Acesso ao grupo suspenso',
+          message: `Seu pagamento falhou 3 vezes. Você foi removido do grupo ${group.name}.`,
+          group: group._id,
+        }).catch(() => {})
+      } else {
+        await Notification.create({
+          user: userId, type: 'invoice_failed',
+          title: 'Pagamento falhou',
+          message: `A cobrança do grupo ${group.name} falhou (${subRec.failedAttempts}/3).`,
+          group: group._id,
+        }).catch(() => {})
+      }
+    }
+  } catch (err) {
+    console.error('[WEBHOOK] invoice.payment_failed:', err.message)
+  }
+}
+
+async function handleSubscriptionDeleted(sub) {
+  const { groupId, userId } = sub.metadata || {}
+  if (!groupId || !userId) return
+  try {
+    const group = await Group.findById(groupId)
+    if (!group) return
+    group.members = group.members.filter(m => String(m) !== userId)
+    group.subscriptions = group.subscriptions.filter(s => s.stripeSubscriptionId !== sub.id)
+    await group.save()
+
+    await Notification.create({
+      user: userId, type: 'subscription_cancelled',
+      title: 'Assinatura cancelada',
+      message: `Sua assinatura do grupo ${group.name} foi cancelada.`,
+      group: group._id,
+    }).catch(() => {})
+  } catch (err) {
+    console.error('[WEBHOOK] subscription.deleted:', err.message)
+  }
+}
+
+async function handlePayoutPaid(payout, accountId) {
+  if (!accountId) return
+  const user = await User.findOne({ stripeAccountId: accountId })
+  if (!user) return
+  await Notification.create({
+    user: user._id, type: 'payout_paid',
+    title: 'Saque concluído!',
+    message: `R$ ${(payout.amount / 100).toFixed(2)} depositado na sua conta bancária.`,
+  }).catch(() => {})
+  await Transaction.findOneAndUpdate({ stripePayoutId: payout.id }, { status: 'completed' }).catch(() => {})
+  console.log(`[WEBHOOK] payout.paid ${payout.id} → user ${user._id}`)
+}
+
+async function handlePayoutFailed(payout, accountId) {
+  if (!accountId) return
+  const user = await User.findOne({ stripeAccountId: accountId })
+  if (!user) return
+  await Notification.create({
+    user: user._id, type: 'payout_failed',
+    title: 'Saque falhou',
+    message: `O saque de R$ ${(payout.amount / 100).toFixed(2)} falhou.`,
+  }).catch(() => {})
+  await Transaction.findOneAndUpdate({ stripePayoutId: payout.id }, { status: 'failed' }).catch(() => {})
 }
 
 module.exports = router
