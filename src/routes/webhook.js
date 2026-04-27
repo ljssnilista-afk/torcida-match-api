@@ -640,6 +640,9 @@ async function handlePayoutFailed(payout, accountId) {
 }
 
 module.exports = router
+}
+
+module.exports = router
 groupId, userId } = sub.metadata || {}
     if (!groupId || !userId) return
 
@@ -722,6 +725,39 @@ async function handlePayoutFailed(payout, accountId) {
     message: `O saque de R$ ${(payout.amount / 100).toFixed(2)} falhou.`,
   }).catch(() => {})
   await Transaction.findOneAndUpdate({ stripePayoutId: payout.id }, { status: 'failed' }).catch(() => {})
+}
+
+module.exports = router
+═══════════════
+async function handlePayoutPaid(payout, accountId) {
+  if (!accountId) return
+  const user = await User.findOne({ stripeAccountId: accountId })
+  if (!user) return
+  await Notification.create({
+    user: user._id, type: 'payout_paid',
+    title: 'Saque concluído!',
+    message: `R$ ${(payout.amount / 100).toFixed(2)} depositado na sua conta bancária.`,
+  }).catch(() => {})
+  await Transaction.findOneAndUpdate({ stripePayoutId: payout.id }, { status: 'completed' }).catch(() => {})
+  console.log(`[WEBHOOK] payout.paid ${payout.id} → user ${user._id}`)
+}
+
+async function handlePayoutFailed(payout, accountId) {
+  if (!accountId) return
+  const user = await User.findOne({ stripeAccountId: accountId })
+  if (!user) return
+  await Notification.create({
+    user: user._id, type: 'payout_failed',
+    title: 'Saque falhou',
+    message: `O saque de R$ ${(payout.amount / 100).toFixed(2)} falhou.`,
+  }).catch(() => {})
+  await Transaction.findOneAndUpdate({ stripePayoutId: payout.id }, { status: 'failed' }).catch(() => {})
+}
+
+module.exports = router
+id },
+    { status: 'failed' }
+  ).catch(() => {})
 }
 
 module.exports = router
